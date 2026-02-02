@@ -204,3 +204,138 @@ def wait_for_changefeed_files(
     
     print(f"   Run Cell 11 to check manually")
     return files_found  # Return True if we found at least some files
+
+
+def delete_changefeed_files(
+    storage_account_name: str,
+    storage_account_key: str,
+    container_name: str,
+    changefeed_path: str,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Delete all changefeed files in Azure Blob Storage for a given path.
+    
+    ⚠️  WARNING: This permanently deletes all CDC data at the specified path!
+    
+    Use this when:
+    - Starting completely fresh
+    - Old data from previous runs is causing sync issues
+    - Table schema changed (e.g., VARCHAR → INT)
+    
+    Args:
+        storage_account_name: Azure storage account name
+        storage_account_key: Azure storage account key
+        container_name: Azure container name
+        changefeed_path: Path to delete (e.g., "parquet/defaultdb/public/usertable/target_table")
+                        Can also use config.cdc_config.path from Config dataclass
+        verbose: Print detailed output (default: True)
+    
+    Returns:
+        dict with keys:
+            - deleted_count: Number of items deleted
+            - failed_count: Number of items that failed to delete
+            - data_files_deleted: Number of .parquet data files deleted
+            - resolved_files_deleted: Number of .RESOLVED files deleted
+            - directories_deleted: Number of directory markers deleted
+    
+    Example:
+        >>> # Using config dataclass
+        >>> result = delete_changefeed_files(
+        ...     storage_account_name=config.azure_storage.account_name,
+        ...     storage_account_key=config.azure_storage.account_key,
+        ...     container_name=config.azure_storage.container_name,
+        ...     changefeed_path=config.cdc_config.path
+        ... )
+        >>> print(f"Deleted {result['deleted_count']} items")
+        
+        >>> # Manual path
+        >>> result = delete_changefeed_files(
+        ...     storage_account_name="mystorageaccount",
+        ...     storage_account_key="<key>",
+        ...     container_name="cockroachcdc",
+        ...     changefeed_path="parquet/defaultdb/public/usertable/target_table"
+        ... )
+    """
+    # Ensure path ends with / for prefix matching
+    if not changefeed_path.endswith('/'):
+        changefeed_path = f"{changefeed_path}/"
+    
+    if verbose:
+        print(f"🗑️  Deleting Azure changefeed data...")
+        print(f"=" * 80)
+        print(f"Container: {container_name}")
+        print(f"Path: {changefeed_path}")
+        print()
+    
+    # Connect to Azure
+    connection_string = f"DefaultEndpointsProtocol=https;AccountName={storage_account_name};AccountKey={storage_account_key};EndpointSuffix=core.windows.net"
+    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    container_client = blob_service.get_container_client(container_name)
+    
+    # List all blobs with this prefix
+    if verbose:
+        print(f"🔍 Scanning for files...")
+    
+    blobs = list(container_client.list_blobs(name_starts_with=changefeed_path))
+    
+    if not blobs:
+        if verbose:
+            print(f"ℹ️  No files found at: {changefeed_path}")
+            print(f"   Files may have already been deleted, or path is incorrect")
+        return {
+            'deleted_count': 0,
+            'failed_count': 0,
+            'data_files_deleted': 0,
+            'resolved_files_deleted': 0,
+            'directories_deleted': 0
+        }
+    
+    # Categorize items
+    data_files = [b for b in blobs if b.size > 0 and '.parquet' in b.name and '.RESOLVED' not in b.name]
+    resolved_files = [b for b in blobs if '.RESOLVED' in b.name]
+    directories = [b for b in blobs if b.size == 0]
+    
+    if verbose:
+        print(f"✅ Found {len(blobs)} items to delete")
+        print(f"   📄 Data files: {len(data_files)}")
+        print(f"   🕐 Resolved files: {len(resolved_files)}")
+        print(f"   📁 Directories: {len(directories)}")
+        print()
+    
+    # Delete all blobs
+    if verbose:
+        print(f"🔄 Deleting {len(blobs)} items...")
+    
+    deleted = 0
+    failed = 0
+    
+    for blob in blobs:
+        try:
+            container_client.delete_blob(blob.name)
+            deleted += 1
+            if verbose and deleted % 50 == 0:
+                print(f"   Deleted {deleted}/{len(blobs)} items...", end='\r')
+        except Exception as e:
+            # Some errors are expected (e.g., directories already removed, blob not found)
+            error_str = str(e)
+            if "DirectoryIsNotEmpty" not in error_str and "BlobNotFound" not in error_str:
+                failed += 1
+                if verbose:
+                    print(f"\n   ⚠️  Failed: {blob.name[:60]}... - {e}")
+    
+    if verbose:
+        print(f"✅ Deleted {deleted} items from Azure                    ")
+        if failed > 0:
+            print(f"   ⚠️  Failed to delete {failed} items")
+        print()
+        print(f"=" * 80)
+        print(f"✅ Cleanup complete!")
+    
+    return {
+        'deleted_count': deleted,
+        'failed_count': failed,
+        'data_files_deleted': len(data_files),
+        'resolved_files_deleted': len(resolved_files),
+        'directories_deleted': len(directories)
+    }

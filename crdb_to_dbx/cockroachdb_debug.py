@@ -1259,6 +1259,7 @@ def inspect_target_table(
 def run_full_diagnosis_from_config(
     spark,
     config,
+    conn=None,
     mismatched_columns: List[str] = None
 ) -> None:
     """
@@ -1273,7 +1274,7 @@ def run_full_diagnosis_from_config(
     - Displays CDC mode information
     
     SECTION 2: Source vs Target Verification  
-    - Connects to CockroachDB source
+    - Connects to CockroachDB source (or uses provided connection)
     - Compares source and target statistics (min/max key, count, sum)
     - Auto-deduplicates target for append_only mode
     - Shows column-by-column sum comparison
@@ -1297,6 +1298,8 @@ def run_full_diagnosis_from_config(
             - tables: TableConfig (source_catalog, source_schema, source_table_name, etc.)
             - azure_storage: AzureStorageConfig (account_name, container_name)
             - cdc_config: CDCConfig (primary_key_columns, mode, column_family_mode)
+        conn: Optional pg8000.native.Connection - If provided, uses this connection.
+              If None, creates a new connection (default: None)
         mismatched_columns: Optional - normally leave as None for auto-detection.
                            Only provide if you want to skip stats and go straight to 
                            detailed diagnosis for specific columns.
@@ -1310,10 +1313,19 @@ def run_full_diagnosis_from_config(
         # - Detailed diagnosis (only if needed)
         run_full_diagnosis_from_config(spark, config)
     
+    Example (With existing connection):
+        from cockroachdb_conn import get_cockroachdb_connection_native
+        
+        conn = get_cockroachdb_connection_native(...)
+        try:
+            run_full_diagnosis_from_config(spark, config, conn=conn)
+        finally:
+            conn.close()  # Caller manages connection
+    
     Example (Skip to detailed diagnosis):
         # If you want to skip stats and focus on specific columns:
         mismatched_columns = ['field3', 'field4']
-        run_full_diagnosis_from_config(spark, config, mismatched_columns)
+        run_full_diagnosis_from_config(spark, config, mismatched_columns=mismatched_columns)
     """
     # Extract config - CockroachDB connection
     host = config.cockroachdb.host
@@ -1409,20 +1421,26 @@ def run_full_diagnosis_from_config(
     print("🔍 SOURCE vs TARGET VERIFICATION")
     print("=" * 80)
     
-    # Establish connection using reusable connection utility
-    print("\n🔌 Establishing CockroachDB connection...")
+    # Establish connection (or use provided one)
+    conn_provided = conn is not None
     
-    from cockroachdb_conn import get_cockroachdb_connection_native
-    
-    conn = get_cockroachdb_connection_native(
-        cockroachdb_host=host,
-        cockroachdb_port=port,
-        cockroachdb_user=user,
-        cockroachdb_password=password,
-        cockroachdb_database=database,
-        test=False  # Skip test, already validated in main connection cell
-    )
-    print("✅ Connection established\n")
+    if conn_provided:
+        print("\n🔌 Using provided CockroachDB connection...")
+        print("✅ Connection ready\n")
+    else:
+        print("\n🔌 Establishing CockroachDB connection...")
+        
+        from cockroachdb_conn import get_cockroachdb_connection_native
+        
+        conn = get_cockroachdb_connection_native(
+            cockroachdb_host=host,
+            cockroachdb_port=port,
+            cockroachdb_user=user,
+            cockroachdb_password=password,
+            cockroachdb_database=database,
+            test=False  # Skip test, already validated in main connection cell
+        )
+        print("✅ Connection established\n")
     
     try:
         # Import helper functions
@@ -1664,8 +1682,12 @@ def run_full_diagnosis_from_config(
         )
         
     finally:
-        conn.close()
-        print("\n🔌 Connection closed")
+        # Only close connection if we created it (not if it was provided)
+        if not conn_provided:
+            conn.close()
+            print("\n🔌 Connection closed")
+        else:
+            print("\n🔌 Connection kept open (managed by caller)")
 
 
 def detailed_missing_keys_investigation(
