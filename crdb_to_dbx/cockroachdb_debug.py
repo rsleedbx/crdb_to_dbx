@@ -1221,7 +1221,7 @@ def inspect_target_table(
 
 def run_full_diagnosis_from_config(
     spark,
-    config: Dict[str, Any],
+    config,
     mismatched_columns: List[str] = None
 ) -> None:
     """
@@ -1255,12 +1255,11 @@ def run_full_diagnosis_from_config(
     
     Args:
         spark: Spark session
-        config: Configuration dictionary with keys:
-            - cockroachdb: {host, port, database, user, password}
-            - cockroachdb_source: {catalog, schema, table_name}
-            - databricks_target: {catalog, schema, table_name}
-            - azure_storage: {account_name, container_name}
-            - cdc_config: {primary_key_columns, mode, column_family_mode}
+        config: Config dataclass from cockroachdb_config.py with:
+            - cockroachdb: CockroachDBConfig (host, port, database, user, password)
+            - tables: TableConfig (source_catalog, source_schema, source_table_name, etc.)
+            - azure_storage: AzureStorageConfig (account_name, container_name)
+            - cdc_config: CDCConfig (primary_key_columns, mode, column_family_mode)
         mismatched_columns: Optional - normally leave as None for auto-detection.
                            Only provide if you want to skip stats and go straight to 
                            detailed diagnosis for specific columns.
@@ -1280,27 +1279,27 @@ def run_full_diagnosis_from_config(
         run_full_diagnosis_from_config(spark, config, mismatched_columns)
     """
     # Extract config - CockroachDB connection
-    host = config["cockroachdb"]["host"]
-    port = config["cockroachdb"]["port"]
-    user = config["cockroachdb"]["user"]
-    password = config["cockroachdb"]["password"]
-    database = config["cockroachdb"]["database"]
+    host = config.cockroachdb.host
+    port = config.cockroachdb.port
+    user = config.cockroachdb.user
+    password = config.cockroachdb.password
+    database = config.cockroachdb.database
     
     # Extract config - Source/Target tables
-    source_catalog = config["cockroachdb_source"]["catalog"]
-    source_schema = config["cockroachdb_source"]["schema"]
-    source_table = config["cockroachdb_source"]["table_name"]
+    source_catalog = config.tables.source_catalog
+    source_schema = config.tables.source_schema
+    source_table = config.tables.source_table_name
     
-    target_catalog = config["databricks_target"]["catalog"]
-    target_schema = config["databricks_target"]["schema"]
-    target_table = config["databricks_target"]["table_name"]
+    target_catalog = config.tables.destination_catalog
+    target_schema = config.tables.destination_schema
+    target_table = config.tables.destination_table_name
     
     # Extract config - Azure storage
-    storage_account_name = config["azure_storage"]["account_name"]
-    container_name = config["azure_storage"]["container_name"]
+    storage_account_name = config.azure_storage.account_name
+    container_name = config.azure_storage.container_name
     
     # Extract config - CDC settings
-    primary_keys = config["cdc_config"]["primary_key_columns"]
+    primary_keys = config.cdc_config.primary_key_columns
     
     # Construct paths
     target_table_fqn = f"{target_catalog}.{target_schema}.{target_table}"
@@ -1333,8 +1332,8 @@ def run_full_diagnosis_from_config(
     print("=" * 80)
     
     # Detect CDC mode
-    cdc_mode_config = config.get("cdc_config", {}).get("mode", "append_only")
-    column_family_mode_config = config.get("cdc_config", {}).get("column_family_mode", "single_cf")
+    cdc_mode_config = config.cdc_config.mode
+    column_family_mode_config = config.cdc_config.column_family_mode
     
     print(f"Total rows: {total_rows:,}")
     print(f"CDC Processing Mode: {cdc_mode_config}")
