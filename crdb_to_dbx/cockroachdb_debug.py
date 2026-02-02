@@ -47,6 +47,43 @@ from pyspark.sql import DataFrame
 from typing import List, Dict, Any, Optional
 
 
+class CDCValidationError(Exception):
+    """
+    Exception raised when CDC validation fails (source vs target mismatch).
+    
+    Attributes:
+        message: Description of the validation failure
+        mismatched_columns: List of column names that failed validation
+        source_count: Row count in source table
+        target_count: Row count in target table
+        details: Additional details about the failure
+    """
+    def __init__(
+        self,
+        message: str,
+        mismatched_columns: List[str] = None,
+        source_count: int = None,
+        target_count: int = None,
+        details: Dict[str, Any] = None
+    ):
+        self.message = message
+        self.mismatched_columns = mismatched_columns or []
+        self.source_count = source_count
+        self.target_count = target_count
+        self.details = details or {}
+        
+        # Build detailed error message
+        error_parts = [message]
+        if mismatched_columns:
+            error_parts.append(f"\nMismatched columns ({len(mismatched_columns)}): {', '.join(mismatched_columns)}")
+        if source_count is not None and target_count is not None:
+            error_parts.append(f"\nRow counts - Source: {source_count:,}, Target: {target_count:,}")
+        if details:
+            error_parts.append(f"\nDetails: {details}")
+        
+        super().__init__('\n'.join(error_parts))
+
+
 def get_column_families(conn, table_name: str) -> Dict[str, List[str]]:
     """
     Get column family assignments for a CockroachDB table.
@@ -1382,7 +1419,8 @@ def run_full_diagnosis_from_config(
         cockroachdb_port=port,
         cockroachdb_user=user,
         cockroachdb_password=password,
-        cockroachdb_database=database
+        cockroachdb_database=database,
+        test=False  # Skip test, already validated in main connection cell
     )
     print("✅ Connection established\n")
     
@@ -1600,6 +1638,31 @@ def run_full_diagnosis_from_config(
             primary_keys=primary_keys,
             mismatched_columns=mismatched_columns or []
         )
+        
+        # After detailed diagnosis, raise exception with validation failure details
+        print("\n" + "=" * 80)
+        print("❌ VALIDATION FAILED - Raising Exception")
+        print("=" * 80)
+        
+        # Prepare detailed error information
+        details = {
+            'source_table': f"{source_catalog}.{source_schema}.{source_table}",
+            'target_table': target_table_fqn,
+            'cdc_mode': cdc_mode_config,
+            'column_family_mode': column_family_mode_config,
+            'min_key_matches': min_key_matches,
+            'max_key_matches': max_key_matches,
+            'count_matches': count_matches,
+        }
+        
+        raise CDCValidationError(
+            message=f"CDC validation failed: {len(detected_mismatches)} column(s) have mismatched data",
+            mismatched_columns=detected_mismatches,
+            source_count=source_stats['count'],
+            target_count=target_stats['count'],
+            details=details
+        )
+        
     finally:
         conn.close()
         print("\n🔌 Connection closed")
