@@ -1,0 +1,11 @@
+# Core dependencies
+pyspark>=3.3.0
+pg8000>=1.29.0
+delta-spark>=2.0.0
+
+# Optional: For development
+# pytest>=7.0.0
+# pytest-cov>=3.0.0
+# black>=22.0.0
+# flake8>=4.0.0
+# mypy>=0.950
