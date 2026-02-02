@@ -51,6 +51,7 @@ class CDCConfig:
     auto_suffix_mode_family: bool
     format: str
     path: str
+    use_resolved_watermark: bool = True  # Use RESOLVED timestamps for column family completeness
 
 
 @dataclass

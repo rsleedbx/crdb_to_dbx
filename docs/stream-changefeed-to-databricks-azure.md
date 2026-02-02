@@ -10,15 +10,17 @@ This guide shows how to stream CockroachDB data to Databricks using CockroachDB 
 
 CockroachDB changefeeds natively generate snapshot and CDC records in Parquet format to Azure Blob Storage. Databricks Auto Loader reads the Parquet files into a streaming DataFrame, Spark transforms the CDC events, and Delta Lake writes them as streaming tables with ACID guarantees.
 
+**Multi-table transactional consistency** is achieved using CockroachDB's RESOLVED timestamp watermarks as authoritative high-water marks: each table's RESOLVED file (written by CockroachDB changefeeds) guarantees that all CDC events up to that timestamp are complete, including all column family fragments. By coordinating ingestion across multiple tables using a shared minimum watermark, you maintain referential integrity and ensure all tables are synchronized to the same transactional point in time, preventing partial transaction visibility and data inconsistencies.
+
 **What Databricks handles natively:**
 - ✅ **SCD Type 1** (target maintains latest INSERT/UPDATE/DELETE state via MERGE INTO)
 - ✅ **SCD Type 2** (target stores all INSERT/UPDATE/DELETE events as rows for full history)
 - ✅ **Column families** (CockroachDB's `split_column_families` for write-heavy concurrent workloads)
-- ✅ **Transactional consistency** (atomic commits with resolved timestamps)
+- ✅ **Multi-table transaction consistency** (atomic commits coordinated across tables with CockroachDB RESOLVED timestamp watermarks)
 - ✅ **Schema evolution** (automatic schema inference and merging)
 - ✅ **Multiple CockroachDB changefeed formats to blob storage** (Parquet, JSON, Avro, CSV)
 
-This guide focuses on **Parquet format** for optimal performance and native Delta Lake integration. For real-time data replication with change data capture (CDC), Databricks provides production-ready streaming pipelines without external dependencies or complex deduplication logic.
+This guide focuses on **Parquet format** for native Delta Lake integration. Parquet is CockroachDB's recommended format for cloud storage changefeeds.
 
 ---
 
@@ -45,15 +47,17 @@ INTO 'azure://changefeed-events/parquet/defaultdb/public/usertable/usertable_cdc
 WITH 
     format='parquet',
     updated,
-    resolved='10s';
+    resolved='10s';  -- ✅ Critical for data consistency (see RESOLVED Timestamps section)
 ```
+
+**Note:** The `resolved='10s'` option is **required for production** workloads with column families or multi-table consistency requirements. It ensures all CDC events and column family fragments are complete before processing.
 
 The CockroachDB changefeed will write Parquet files to Azure in this structure:
 ```
 changefeed-events/parquet/defaultdb/public/usertable/usertable_cdc/
   ├── 2026-01-28/
   │   ├── 202601281910402079962990000000000-abc123.parquet  (data files)
-  │   ├── 1738110640000000000.RESOLVED                       (watermark files)
+  │   ├── 202601281910500000000000000000000.RESOLVED        (watermark - guarantees completeness)
   └── ...
 ```
 
@@ -70,19 +74,9 @@ The CockroachDB changefeed automatically captures these changes and writes them 
 
 ### Step 4. Configure Azure access *(Databricks)*
 
-Before reading data from Azure Blob Storage, configure Databricks to access your storage account using one of these methods:
-- **Service principal** (recommended for production)
-- **SAS token** (temporary access)
-- **Account key** (full access)
+Configure Unity Catalog to access your Azure storage account using external locations with storage credentials. This approach works with all compute types including Databricks Serverless.
 
-See [Connect to Azure Data Lake Storage and Blob Storage](https://docs.databricks.com/aws/en/connect/storage/azure-storage) for detailed setup instructions.
-
-**Example using account key:**
-```python
-spark.conf.set(
-    "fs.azure.account.key.<storage-account>.dfs.core.windows.net",
-    dbutils.secrets.get(scope="<scope>", key="<storage-account-access-key>"))
-```
+See [Connect to cloud object storage using Unity Catalog](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/) for setup instructions.
 
 ### Step 5. Stream into Databricks Delta Lake *(Databricks)*
 
@@ -102,9 +96,10 @@ raw_df = (spark.readStream
 )
 
 # Transform CockroachDB CDC format to Delta Lake
+# Note: __crdb__updated is HLC format '1234567890123456789.0000000001' (wall_time.logical)
 df = raw_df.select(
     "*",
-    F.from_unixtime(F.col("__crdb__updated").cast("double") / 1e9).cast("timestamp").alias("_cdc_timestamp"),
+    F.from_unixtime(F.split(F.col("__crdb__updated"), "\\.")[0].cast("bigint") / 1000000000).cast("timestamp").alias("_cdc_timestamp"),
     F.when(F.col("__crdb__event_type") == "d", "DELETE").otherwise("UPSERT").alias("_cdc_operation")
 ).drop("__crdb__updated", "__crdb__event_type")
 
@@ -201,13 +196,14 @@ delta_table.merge(deduped_df, "target.ycsb_key = source.ycsb_key") \
     .execute()
 ```
 
-**Why two stages?** This pattern is supported on all Databricks editions, including Serverless and Lakeflow Spark Declarative Pipelines (SDP, formerly Delta Live Tables). Benefits include:
-- **Batching efficiency** - Accumulate and deduplicate multiple CDC events, reducing MERGE operations
-- **Backpressure handling** - Buffer events in staging if target table is under heavy load
-- **Inspectability** - Inspect raw CDC events in staging before applying to target
-- **Flexibility** - Add business logic, data quality checks, or enrichment between stages
-- **Reliability** - If MERGE fails, CDC events remain in staging for retry
-- **Cost optimization** - Batch processing is more efficient than continuous micro-batches
+**Why two stages?** This follows the **Databricks Medallion Architecture** pattern:
+- **Stage 1 (Streaming)** = Bronze layer - Raw CDC ingestion
+- **Stage 2 (Batch MERGE)** = Silver layer - Cleaned, deduplicated data
+
+Supported on all Databricks editions including Serverless and Lakeflow Spark Declarative Pipelines (SDP). Key benefits:
+- **Performance** - Batch and deduplicate events, reducing MERGE operations and handling backpressure
+- **Reliability** - Staging buffer enables retry if MERGE fails, preventing data loss
+- **Observability** - Inspect raw CDC events and add business logic or data quality checks between stages
 
 ---
 
@@ -215,34 +211,74 @@ delta_table.merge(deduped_df, "target.ycsb_key = source.ycsb_key") \
 
 For tables with multiple column families (used for write-heavy concurrent workloads to reduce the number of write intents per transaction):
 
-**1. Enable `split_column_families` in CockroachDB changefeed:**
+> ⚠️ **CRITICAL:** Always use `resolved` option with column families to guarantee fragment completeness. Without it, you risk writing incomplete rows with NULL values (data corruption). See [RESOLVED Timestamps](#resolved-timestamps-guaranteeing-data-consistency) section for details.
+
+**1. Enable `split_column_families` and `resolved` in CockroachDB changefeed:**
 ```sql
 CREATE CHANGEFEED FOR TABLE usertable_wide
 INTO 'azure://...'
 WITH 
     format='parquet',
     updated,
-    split_column_families,  -- ← This is key
+    split_column_families,  -- ← Generates multiple files per update
+    resolved='10s',         -- ← ✅ REQUIRED to guarantee completeness
     initial_scan='yes';
 ```
 
 **2. Merge fragments in Databricks:**
 ```python
-def merge_column_family_fragments(df, primary_keys):
-    """Merge column family fragments into complete rows."""
-    group_by_cols = primary_keys + ['_cdc_timestamp', '_cdc_operation']
-    
-    # Coalesce NULL values across fragments
-    agg_exprs = [F.first(col, ignorenulls=True).alias(col) for col in data_columns]
-    
-    return df.groupBy(*group_by_cols).agg(*agg_exprs)
+from crdb_to_dbx import merge_column_family_fragments
 
-# Use in pipeline
-df_merged = merge_column_family_fragments(raw_df, ["ycsb_key"])
+# Use production-ready merge implementation
+df_merged = merge_column_family_fragments(
+    df=raw_df,
+    primary_key_columns=["ycsb_key"]
+)
+
+# Write to target
 df_merged.writeStream.toTable(target_table)
 ```
 
+The `merge_column_family_fragments` function groups by primary key and timestamp, then coalesces NULL values across fragments using PySpark aggregations.
+
 **Why use column families?** Column families group columns into single key-value pairs, reducing the number of write intents per transaction for write-heavy concurrent workloads. With `split_column_families` enabled in CockroachDB changefeeds, CockroachDB generates multiple files per update (one per column family), so merging reconstructs complete rows.
+
+---
+
+## RESOLVED Timestamps: Guaranteeing Data Consistency
+
+CockroachDB changefeeds with the `resolved` option write `.RESOLVED` files that guarantee all CDC events and column family fragments are complete up to a specific timestamp. This prevents data corruption from incomplete updates and enables multi-table consistency.
+
+**When to use RESOLVED timestamps:**
+- ✅ **Required:** Tables with multiple column families (`split_column_families`)
+- ✅ **Recommended:** Multi-table CDC with referential integrity requirements
+- ✅ **Optional:** Single-column-family tables (adds completeness guarantee)
+
+### Using RESOLVED Timestamps with Auto Loader
+
+```python
+from crdb_to_dbx import ingest_cdc_with_merge_multi_family
+
+# Configure changefeed with resolved option
+# CREATE CHANGEFEED FOR TABLE usertable
+# INTO 'azure://...'
+# WITH format='parquet', updated, resolved='10s';
+
+# Auto Loader with RESOLVED watermarking (default)
+result = ingest_cdc_with_merge_multi_family(
+    config=config,
+    spark=spark
+    # Automatically uses latest RESOLVED timestamp for filtering
+)
+```
+
+**What happens:**
+1. Scans Azure for `.RESOLVED` files
+2. Extracts latest watermark timestamp
+3. Filters CDC events: `__crdb__updated <= watermark`
+4. Guarantees all column family fragments are complete
+
+For multi-table coordination, column family details, and advanced usage, see the [crdb_to_dbx implementation](https://github.com/rsleedbx/crdb_to_dbx/tree/master/crdb_to_dbx).
 
 ---
 
@@ -257,4 +293,12 @@ df_merged.writeStream.toTable(target_table)
 
 ---
 
-**About this guide**: Maintained by Lakeflow Community Connectors | [GitHub](https://github.com/databricks/lakeflow-community-connectors) | Apache 2.0 License
+## Credits
+
+**Author**: [Robert Lee](https://credentials.databricks.com/profile/robertlee941580/wallet), Field Engineer at Databricks
+
+This guide was created with guidance from [Andrew Deally](https://andrewdeally.medium.com/).
+
+---
+
+**License**: Apache 2.0

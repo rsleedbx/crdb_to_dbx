@@ -5,7 +5,7 @@ This module provides Azure Blob Storage utilities for CockroachDB CDC changefeed
 """
 
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from azure.storage.blob import BlobServiceClient
 
 
@@ -102,16 +102,24 @@ def wait_for_changefeed_files(
     target_table: str,
     max_wait: int = 120,
     check_interval: int = 5,
-    stabilization_wait: int = 5,
-    format: str = "parquet"
-) -> bool:
+    stabilization_wait: Optional[int] = None,
+    format: str = "parquet",
+    wait_for_resolved: bool = True
+) -> Dict[str, Any]:
     """
-    Wait for changefeed files to appear in Azure with timeout and stabilization period.
+    Wait for changefeed files to appear in Azure with timeout.
     
-    This function:
-    1. Polls Azure until first file(s) appear
-    2. Once files are detected, waits for additional files (important for column families)
-    3. Exits when no new files appear for 'stabilization_wait' seconds
+    This function can operate in two modes:
+    1. RESOLVED mode (wait_for_resolved=True): Waits for .RESOLVED file to appear ✅ RECOMMENDED
+       - CRITICAL for column family completeness guarantee
+       - Returns the RESOLVED filename for coordination
+       - No stabilization wait needed (RESOLVED guarantees completeness)
+       - Recommended for production multi-CF tables
+    
+    2. Data file mode (wait_for_resolved=False): Waits for data files with stabilization
+       - Legacy mode for backward compatibility
+       - Uses stabilization_wait to detect when all files have landed
+       - Not recommended for production (use RESOLVED mode instead)
     
     Args:
         storage_account_name: Azure storage account name
@@ -121,89 +129,185 @@ def wait_for_changefeed_files(
         source_schema: CockroachDB schema
         source_table: Source table name
         target_table: Target table name
-        max_wait: Maximum seconds to wait for initial files (default: 120)
+        max_wait: Maximum seconds to wait for files (default: 120)
         check_interval: Seconds between checks (default: 5)
-        stabilization_wait: Seconds to wait for file count to stabilize (default: 5)
-                           Important for column family mode where multiple files are written
+        stabilization_wait: Seconds to wait for file count to stabilize (default: None)
+                           - If None: Defaults to 5s in legacy mode, unused in RESOLVED mode
+                           - Only used when wait_for_resolved=False
+                           - Ignored in RESOLVED mode (not needed)
         format: Changefeed format (default: "parquet")
+        wait_for_resolved: If True, wait for RESOLVED file (recommended, default)
+                          If False, wait for data files (legacy mode)
     
     Returns:
-        True if files found, False if timeout
+        dict with:
+        - 'success': bool - True if files/RESOLVED found
+        - 'resolved_file': str or None - RESOLVED filename if wait_for_resolved=True
+        - 'elapsed_time': int - Total seconds waited
+        - 'file_count': int - Number of files found
     
-    Example:
-        >>> success = wait_for_changefeed_files(
+    Example (RESOLVED mode - Recommended):
+        >>> result = wait_for_changefeed_files(
         ...     storage_account_name="mystorageaccount",
         ...     storage_account_key="<key>",
         ...     container_name="cockroachcdc",
         ...     source_catalog="defaultdb",
         ...     source_schema="public",
         ...     source_table="usertable",
-        ...     target_table="usertable_append_only_multi_cf",
+        ...     target_table="usertable",
         ...     max_wait=300,
-        ...     check_interval=5,
-        ...     stabilization_wait=5
+        ...     wait_for_resolved=True  # ✅ Wait for RESOLVED
         ... )
-        >>> if success:
-        ...     print("Files are ready for ingestion!")
+        >>> if result['success']:
+        ...     print(f"RESOLVED file: {result['resolved_file']}")
+        ...     # Use for watermark coordination
+    
+    Example (Legacy mode):
+        >>> result = wait_for_changefeed_files(
+        ...     storage_account_name="mystorageaccount",
+        ...     storage_account_key="<key>",
+        ...     container_name="cockroachcdc",
+        ...     source_catalog="defaultdb",
+        ...     source_schema="public",
+        ...     source_table="usertable",
+        ...     target_table="usertable",
+        ...     wait_for_resolved=False  # Legacy data file mode
+        ... )
     """
-    print(f"⏳ Waiting for initial snapshot files to appear in Azure...")
+    if wait_for_resolved:
+        # ====================================================================
+        # RESOLVED MODE: Wait for .RESOLVED file (RECOMMENDED)
+        # ====================================================================
+        print(f"⏳ Waiting for RESOLVED file to appear in Azure...")
+        print(f"   This ensures all CDC events and column family fragments are complete")
+        print(f"   No stabilization wait needed - RESOLVED guarantees completeness")
+        
+        elapsed = 0
+        resolved_file = None
+        
+        while elapsed < max_wait:
+            result = check_azure_files(
+                storage_account_name, storage_account_key, container_name,
+                source_catalog, source_schema, source_table, target_table,
+                verbose=False,
+                format=format
+            )
+            
+            resolved_files = result['resolved_files']
+            
+            if resolved_files:
+                # RESOLVED file found!
+                resolved_file = resolved_files[-1].name  # Get latest RESOLVED file
+                data_file_count = len(result['data_files'])
+                
+                print(f"\n✅ RESOLVED file found after {elapsed} seconds!")
+                print(f"   RESOLVED file: {resolved_file}")
+                print(f"   Data files: {data_file_count}")
+                print(f"   💡 All CDC events up to this RESOLVED timestamp are complete")
+                
+                return {
+                    'success': True,
+                    'resolved_file': resolved_file,
+                    'elapsed_time': elapsed,
+                    'file_count': data_file_count
+                }
+            
+            print(f"   Checking... ({elapsed}s elapsed)", end='\r')
+            time.sleep(check_interval)
+            elapsed += check_interval
+        
+        # Timeout
+        print(f"\n⚠️  Timeout after {max_wait}s - no RESOLVED file appeared")
+        print(f"   This may indicate:")
+        print(f"   1. Changefeed has not written RESOLVED file yet (increase max_wait)")
+        print(f"   2. Changefeed not configured with 'resolved' option")
+        print(f"   3. Path or table name mismatch")
+        
+        return {
+            'success': False,
+            'resolved_file': None,
+            'elapsed_time': elapsed,
+            'file_count': 0
+        }
     
-    elapsed = 0
-    files_found = False
-    last_file_count = 0
-    stable_elapsed = 0
-    
-    while elapsed < max_wait:
-        result = check_azure_files(
-            storage_account_name, storage_account_key, container_name,
-            source_catalog, source_schema, source_table, target_table,
-            verbose=False,
-            format=format
-        )
+    else:
+        # ====================================================================
+        # LEGACY MODE: Wait for data files with stabilization
+        # ====================================================================
+        # Set default stabilization_wait for legacy mode
+        if stabilization_wait is None:
+            stabilization_wait = 5  # Default 5 seconds for legacy mode
         
-        current_file_count = len(result['data_files'])
+        print(f"⏳ Waiting for initial snapshot files to appear in Azure...")
+        print(f"   (Legacy mode - consider using wait_for_resolved=True)")
+        print(f"   Using stabilization wait: {stabilization_wait}s")
         
-        if not files_found and current_file_count > 0:
-            # First files detected - switch to stabilization mode
-            files_found = True
-            last_file_count = current_file_count
-            stable_elapsed = 0
-            print(f"\n✅ First files appeared after {elapsed} seconds!")
-            print(f"   Found {current_file_count} file(s) so far...")
-            print(f"   Waiting {stabilization_wait}s for more files (column family fragments)...")
+        elapsed = 0
+        files_found = False
+        last_file_count = 0
+        stable_elapsed = 0
         
-        elif files_found:
-            # In stabilization mode - check if file count is stable
-            if current_file_count > last_file_count:
-                # More files arrived - reset stabilization timer
-                print(f"   📄 File count increased: {last_file_count} → {current_file_count}")
+        while elapsed < max_wait:
+            result = check_azure_files(
+                storage_account_name, storage_account_key, container_name,
+                source_catalog, source_schema, source_table, target_table,
+                verbose=False,
+                format=format
+            )
+            
+            current_file_count = len(result['data_files'])
+            
+            if not files_found and current_file_count > 0:
+                # First files detected - switch to stabilization mode
+                files_found = True
                 last_file_count = current_file_count
                 stable_elapsed = 0
-            else:
-                # File count unchanged - increment stabilization timer
-                stable_elapsed += check_interval
-                
-                if stable_elapsed >= stabilization_wait:
-                    # Stabilization period complete - all files have landed
-                    print(f"\n✅ File count stable at {current_file_count} for {stabilization_wait}s")
-                    print(f"   Total wait time: {elapsed + stable_elapsed}s")
-                    print(f"   Example: {result['data_files'][0].name}")
-                    return True
+                print(f"\n✅ First files appeared after {elapsed} seconds!")
+                print(f"   Found {current_file_count} file(s) so far...")
+                print(f"   Waiting {stabilization_wait}s for more files (column family fragments)...")
+            
+            elif files_found:
+                # In stabilization mode - check if file count is stable
+                if current_file_count > last_file_count:
+                    # More files arrived - reset stabilization timer
+                    print(f"   📄 File count increased: {last_file_count} → {current_file_count}")
+                    last_file_count = current_file_count
+                    stable_elapsed = 0
+                else:
+                    # File count unchanged - increment stabilization timer
+                    stable_elapsed += check_interval
+                    
+                    if stable_elapsed >= stabilization_wait:
+                        # Stabilization period complete - all files have landed
+                        print(f"\n✅ File count stable at {current_file_count} for {stabilization_wait}s")
+                        print(f"   Total wait time: {elapsed + stable_elapsed}s")
+                        print(f"   Example: {result['data_files'][0].name}")
+                        
+                        return {
+                            'success': True,
+                            'resolved_file': None,
+                            'elapsed_time': elapsed + stable_elapsed,
+                            'file_count': current_file_count
+                        }
+            
+            if not files_found:
+                print(f"   Checking... ({elapsed}s elapsed)", end='\r')
+            
+            time.sleep(check_interval)
+            elapsed += check_interval
         
-        if not files_found:
-            print(f"   Checking... ({elapsed}s elapsed)", end='\r')
+        # Timeout
+        if files_found:
+            print(f"\n⚠️  Timeout after {max_wait}s (found {last_file_count} files but more may still be generating)")
+        else:
+            print(f"\n⚠️  Timeout after {max_wait}s - no files appeared")
         
-        time.sleep(check_interval)
-        elapsed += check_interval
-    
-    if files_found:
-        # Files were found but stabilization didn't complete within max_wait
-        print(f"\n⚠️  Timeout after {max_wait}s (found {last_file_count} files but more may still be generating)")
-    else:
-        print(f"\n⚠️  Timeout after {max_wait}s - no files appeared")
-    
-    print(f"   Run Cell 11 to check manually")
-    return files_found  # Return True if we found at least some files
+        return {
+            'success': files_found,
+            'resolved_file': None,
+            'elapsed_time': elapsed,
+            'file_count': last_file_count
+        }
 
 
 def delete_changefeed_files(

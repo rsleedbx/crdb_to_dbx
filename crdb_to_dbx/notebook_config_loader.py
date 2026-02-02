@@ -9,11 +9,9 @@ from urllib.parse import quote
 # Try to load config from external file, fallback to embedded config
 config = None
 config_file_paths = [
-    # Option 1: Local .env directory (for development)
-    "/Users/robert.lee/github/lakeflow-community-connectors/sources/cockroachdb/.env/cockroachdb_cdc_tutorial_config.json",
-    # Option 2: Same directory as notebook (Databricks workspace)
+    # Option 1: Same directory as notebook (Databricks workspace)
     "cockroachdb_cdc_tutorial_config.json",
-    # Option 3: Unity Catalog Volume (uncomment and modify as needed)
+    # Option 2: Unity Catalog Volume (uncomment and modify as needed)
     # "/Volumes/main/your_schema/your_volume/cockroachdb_cdc_tutorial_config.json",
 ]
 

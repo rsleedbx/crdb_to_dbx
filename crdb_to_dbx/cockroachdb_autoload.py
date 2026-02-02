@@ -15,8 +15,9 @@ from cockroachdb.py that includes the deduplicate_to_latest_state parameter
 for robust NULL handling in column families.
 """
 
-from typing import List
+from typing import List, Optional
 from pyspark.sql import functions as F
+from datetime import datetime
 
 
 # ============================================================================
@@ -63,7 +64,7 @@ def _setup_autoloader(spark, source_path, checkpoint_path, source_table):
     )
 
 
-def _transform_cdc_columns(raw_df):
+def _transform_cdc_columns(raw_df, resolved_watermark: Optional[int] = None):
     """
     Transform CockroachDB CDC columns to standard format.
     
@@ -71,23 +72,54 @@ def _transform_cdc_columns(raw_df):
     - __crdb__updated (nanoseconds) → _cdc_timestamp (timestamp)
     - __crdb__event_type ('d'/'c'/'r') → _cdc_operation ('DELETE'/'UPSERT')
     
+    Optionally filters by RESOLVED timestamp watermark to guarantee completeness.
+    
     Args:
         raw_df: Raw DataFrame from Auto Loader
+        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+                           If provided, only events with __crdb__updated <= watermark are kept.
+                           This GUARANTEES all column family fragments have arrived.
     
     Returns:
         DataFrame: Transformed DataFrame with standard CDC columns
     """
-    return raw_df.select(
+    # Helper function to extract wall time from CockroachDB HLC timestamp
+    # __crdb__updated format: "1770067697320026017.0000000002" (wall_time.logical)
+    # We extract just the wall_time part (before decimal) for filtering and conversion
+    def extract_wall_time(col):
+        """Extract wall time nanoseconds from CockroachDB HLC timestamp string."""
+        return F.split(F.col(col), "\\.")[0].cast("bigint")
+    
+    df = raw_df.select(
         "*",
         # Convert __crdb__updated (nanoseconds) to timestamp
+        # Extract wall time from HLC format (before decimal point)
         F.from_unixtime(
-            F.col("__crdb__updated").cast("double").cast("bigint") / 1000000000
+            extract_wall_time("__crdb__updated") / 1000000000
         ).cast("timestamp").alias("_cdc_timestamp"),
         # Map event type
         F.when(F.col("__crdb__event_type") == "d", "DELETE")
          .otherwise("UPSERT")
          .alias("_cdc_operation")
-    ).drop("__crdb__updated", "__crdb__event_type")
+    ).drop("__crdb__event_type", "__crdb__updated")
+    
+    # Apply RESOLVED watermark filtering if provided
+    if resolved_watermark is not None:
+        print(f"   🔒 Applying RESOLVED watermark filter: timestamp ≤ {resolved_watermark}")
+        # Note: raw_df still has __crdb__updated before drop, so filter on original df
+        # Extract wall time and compare with watermark
+        df = raw_df.filter(extract_wall_time("__crdb__updated") <= resolved_watermark).select(
+            "*",
+            F.from_unixtime(
+                extract_wall_time("__crdb__updated") / 1000000000
+            ).cast("timestamp").alias("_cdc_timestamp"),
+            F.when(F.col("__crdb__event_type") == "d", "DELETE")
+             .otherwise("UPSERT")
+             .alias("_cdc_operation")
+        ).drop("__crdb__event_type", "__crdb__updated")
+        print(f"   ✅ RESOLVED watermark applied - only complete data will be processed")
+    
+    return df
 
 
 def _print_ingestion_header(config, mode, column_family_mode, source_path, target_table_fqn):
@@ -120,6 +152,231 @@ def _print_ingestion_header(config, mode, column_family_mode, source_path, targe
     print(f"   ✅ Includes: Data files")
     print(f"   ❌ Excludes: .RESOLVED, _metadata/, _SUCCESS, etc.")
     print()
+
+
+def _get_resolved_watermark(config, source_table: str) -> Optional[int]:
+    """
+    Get the latest RESOLVED timestamp watermark from CockroachDB CDC .RESOLVED files.
+    
+    RESOLVED files guarantee that all CDC events with timestamp ≤ RESOLVED have been written.
+    This is CRITICAL for column family completeness - ensures all fragments have arrived.
+    
+    How it works:
+    1. Reads all .RESOLVED files for the source table from Azure Blob Storage (using Azure SDK)
+    2. Extracts the resolved timestamp from the filename (nanoseconds since epoch)
+    3. Returns the MAXIMUM resolved timestamp (latest safe watermark)
+    
+    RESOLVED filename format: <table>.RESOLVED.<nanos>
+    Example: ycsb.RESOLVED.1704067200000000000
+    
+    Args:
+        config: Configuration object with Azure credentials
+        source_table: Source table name (e.g., "ycsb")
+    
+    Returns:
+        int: Latest RESOLVED timestamp in nanoseconds, or None if no RESOLVED files found
+    
+    Example:
+        >>> watermark = _get_resolved_watermark(config, "ycsb")
+        >>> if watermark:
+        >>>     print(f"Safe to process events up to {watermark} nanos")
+        >>>     df = df.filter(F.col("__crdb__updated") <= watermark)
+    """
+    try:
+        # Import cockroachdb_azure (works in notebooks and when package is installed)
+        import cockroachdb_azure
+        
+        # Use Azure SDK to list files (works in all environments)
+        print(f"   🔍 Scanning for .RESOLVED files in Azure Blob Storage...")
+        
+        result = cockroachdb_azure.check_azure_files(
+            storage_account_name=config.azure_storage.account_name,
+            storage_account_key=config.azure_storage.account_key,
+            container_name=config.azure_storage.container_name,
+            source_catalog=config.tables.source_catalog,
+            source_schema=config.tables.source_schema,
+            source_table=source_table,
+            target_table=config.tables.destination_table_name,
+            verbose=False,
+            format=config.cdc_config.format
+        )
+        
+        resolved_files = result['resolved_files']
+        
+        if not resolved_files:
+            print(f"   ⚠️  No .RESOLVED files found for table '{source_table}'")
+            print(f"      Proceeding without RESOLVED watermarking (all data will be processed)")
+            return None
+        
+        print(f"   📁 Found {len(resolved_files)} .RESOLVED file(s)")
+        if resolved_files:
+            print(f"   📄 Example RESOLVED file: {resolved_files[0].name}")
+        
+        # Extract timestamps from filenames
+        # CockroachDB RESOLVED file formats (observed patterns):
+        # - Format 1: <timestamp_nanos>.RESOLVED (e.g., 1738468800000000000.RESOLVED)
+        # - Format 2: <timestamp>-<jobid>-...-<table>.RESOLVED (CDC file naming pattern)
+        # - Format 3: path/to/<timestamp>.RESOLVED.parquet
+        timestamps = []
+        for file in resolved_files:
+            try:
+                # Get just the filename (not the full path)
+                full_path = file.name
+                filename = full_path.split('/')[-1]  # Get last part after /
+                
+                # Remove .parquet extension if present
+                if filename.endswith('.parquet'):
+                    filename = filename[:-8]  # Remove '.parquet'
+                
+                # The timestamp is typically the FIRST part (before first dash or dot)
+                # Split by dash first (for CDC file naming pattern)
+                if '-' in filename:
+                    first_part = filename.split('-')[0]
+                else:
+                    # Split by dot (for simple timestamp.RESOLVED format)
+                    first_part = filename.split('.')[0]
+                
+                # Parse timestamp based on format
+                # CockroachDB uses HLC (Hybrid Logical Clock) timestamps in RESOLVED filenames
+                if first_part.isdigit():
+                    timestamp_str = first_part
+                    
+                    # CockroachDB HLC format (33 digits): YYYYMMDDHHMMSS + NNNNNNNNN + LLLLLLLLLL
+                    # where: 14 digits datetime + 9 digits nanos + 10 digits logical
+                    if len(timestamp_str) == 33:
+                        # Parse CockroachDB HLC format
+                        from datetime import datetime as dt
+                        
+                        # Extract components
+                        datetime_part = timestamp_str[:14]  # YYYYMMDDHHMMSS
+                        nanos_part = timestamp_str[14:23]    # 9 digits
+                        logical_part = timestamp_str[23:33]  # 10 digits
+                        
+                        # Convert datetime to Unix timestamp
+                        year = int(datetime_part[0:4])
+                        month = int(datetime_part[4:6])
+                        day = int(datetime_part[6:8])
+                        hour = int(datetime_part[8:10])
+                        minute = int(datetime_part[10:12])
+                        second = int(datetime_part[12:14])
+                        
+                        dt_obj = dt(year, month, day, hour, minute, second)
+                        unix_seconds = int(dt_obj.timestamp())
+                        
+                        # Convert to nanoseconds and add nanosecond component
+                        timestamp_nanos = (unix_seconds * 1_000_000_000) + int(nanos_part)
+                        timestamps.append(timestamp_nanos)
+                        
+                    # Standard Unix nanosecond timestamp (19 digits)
+                    elif 18 <= len(timestamp_str) <= 19:
+                        timestamp_nanos = int(timestamp_str)
+                        if timestamp_nanos < 10_000_000_000_000_000_000:
+                            timestamps.append(timestamp_nanos)
+                        else:
+                            print(f"   ⚠️  Timestamp out of valid range: {timestamp_str}")
+                    else:
+                        print(f"   ⚠️  Unexpected timestamp length ({len(timestamp_str)} digits): {timestamp_str}")
+                else:
+                    print(f"   ⚠️  Could not extract timestamp from: {filename} (first_part={first_part})")
+            except (IndexError, ValueError) as e:
+                print(f"   ⚠️  Skipping malformed RESOLVED file: {full_path} ({e})")
+                continue
+        
+        if not timestamps:
+            print(f"   ⚠️  No valid .RESOLVED timestamps found")
+            print(f"      Check RESOLVED file naming format")
+            return None
+        
+        # Get the MAXIMUM (latest) RESOLVED timestamp
+        max_resolved = max(timestamps)
+        
+        # Convert to human-readable datetime for logging
+        try:
+            max_resolved_seconds = max_resolved / 1_000_000_000
+            max_resolved_dt = datetime.fromtimestamp(max_resolved_seconds)
+            datetime_str = max_resolved_dt.strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, OSError, OverflowError) as e:
+            # Timestamp out of range for datetime conversion
+            print(f"   ⚠️  Could not convert timestamp to datetime: {e}")
+            datetime_str = f"<timestamp: {max_resolved} nanos>"
+        
+        print(f"   ✅ Found {len(resolved_files)} .RESOLVED file(s)")
+        print(f"   ✅ Latest RESOLVED watermark: {max_resolved} nanos")
+        print(f"      ({datetime_str} UTC)")
+        print(f"   💡 Only events with timestamp ≤ {max_resolved} will be processed")
+        print(f"      This GUARANTEES all column family fragments have arrived")
+        print()
+        
+        return max_resolved
+        
+    except Exception as e:
+        print(f"   ⚠️  Error reading .RESOLVED files: {e}")
+        print(f"      Proceeding without RESOLVED watermarking")
+        return None
+
+
+def _resolve_watermark(
+    config,
+    source_table: str,
+    resolved_watermark: Optional[int],
+    is_multi_cf: bool = False
+) -> Optional[int]:
+    """
+    Resolve the RESOLVED watermark to use for CDC ingestion.
+    
+    This helper consolidates watermark resolution logic across all ingestion functions.
+    
+    Logic:
+    1. If watermark disabled in config: Return None (no watermarking)
+    2. If watermark provided by caller: Use it (multi-table coordination)
+    3. Otherwise: Compute from .RESOLVED files (using Azure SDK)
+    
+    Args:
+        config: Config dataclass with Azure credentials
+        source_table: Source table name
+        resolved_watermark: Optional watermark provided by caller
+        is_multi_cf: True if multi-CF mode (affects warning messages)
+    
+    Returns:
+        int: RESOLVED timestamp in nanoseconds, or None if disabled/unavailable
+    """
+    # Check if RESOLVED watermarking is enabled in config
+    if not config.cdc_config.use_resolved_watermark:
+        print("⚠️  RESOLVED Watermarking: DISABLED")
+        if is_multi_cf:
+            print("   WARNING: Column family fragments may be incomplete!")
+        print("   Recommendation: Set config.cdc_config.use_resolved_watermark = True")
+        print()
+        return None
+    
+    # RESOLVED watermarking is enabled
+    if resolved_watermark is not None:
+        # Watermark provided by caller (multi-table coordination)
+        print(f"🔒 RESOLVED Watermarking: ENABLED (provided by caller)")
+        print(f"   Using watermark: {resolved_watermark} nanos")
+        if is_multi_cf:
+            print(f"   This GUARANTEES all column family fragments are complete before processing")
+        print(f"   💡 Shared watermark ensures consistency across multiple tables")
+        print()
+        return resolved_watermark
+    
+    # Compute watermark from .RESOLVED files
+    if is_multi_cf:
+        print("🔒 RESOLVED Watermarking: ENABLED")
+        print("   This GUARANTEES all column family fragments are complete before processing")
+    else:
+        print("🔒 RESOLVED Watermarking: ENABLED (optional for single-CF tables)")
+    
+    computed_watermark = _get_resolved_watermark(config, source_table)
+    
+    if computed_watermark and is_multi_cf:
+        print("   ✅ RESOLVED watermark will be applied to CDC events")
+        print()
+    elif not computed_watermark and is_multi_cf:
+        print("   ⚠️  No RESOLVED watermark found - proceeding with all data")
+        print()
+    
+    return computed_watermark
 
 
 # ============================================================================
@@ -339,7 +596,8 @@ def _merge_staging_to_target(spark, staging_table_fqn, target_table_fqn, primary
 
 def ingest_cdc_append_only_single_family(
     config,
-    spark
+    spark,
+    resolved_watermark: Optional[int] = None
 ):
     """
     Ingest CDC events in APPEND-ONLY mode for single column family tables.
@@ -359,6 +617,9 @@ def ingest_cdc_append_only_single_family(
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
+        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+                           If provided, uses this watermark (for multi-table coordination).
+                           If None, will compute from .RESOLVED files if enabled.
     
     Returns:
         StreamingQuery object
@@ -369,6 +630,14 @@ def ingest_cdc_append_only_single_family(
     # Print ingestion header
     _print_ingestion_header(config, "append_only", "single_cf", source_path, target_table_fqn)
     
+    # Resolve RESOLVED watermark (use provided or compute)
+    resolved_watermark = _resolve_watermark(
+        config=config,
+        source_table=config.tables.source_table_name,
+        resolved_watermark=resolved_watermark,
+        is_multi_cf=False  # Single-CF mode
+    )
+    
     # Read with Auto Loader
     raw_df = _setup_autoloader(spark, source_path, checkpoint_path, config.tables.source_table_name)
     
@@ -377,7 +646,7 @@ def ingest_cdc_append_only_single_family(
     print()
     
     # Transform: CockroachDB CDC → Standard CDC format
-    df = _transform_cdc_columns(raw_df)
+    df = _transform_cdc_columns(raw_df, resolved_watermark=resolved_watermark)
     
     # Write to Delta table (append_only)
     query = (df.writeStream
@@ -394,7 +663,8 @@ def ingest_cdc_append_only_single_family(
 
 def ingest_cdc_with_merge_single_family(
     config,
-    spark
+    spark,
+    resolved_watermark: Optional[int] = None
 ):
     """
     Ingest CDC events with MERGE logic for single column family tables.
@@ -424,6 +694,9 @@ def ingest_cdc_with_merge_single_family(
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
+        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+                           If provided, uses this watermark (for multi-table coordination).
+                           If None, will compute from .RESOLVED files if enabled.
     
     Returns:
         Dict with query, staging_table, target_table, raw_count, deduped_count, merged
@@ -442,6 +715,14 @@ def ingest_cdc_with_merge_single_family(
     print(f"Primary keys: {primary_key_columns}")
     print()
     
+    # Resolve RESOLVED watermark (use provided or compute)
+    resolved_watermark = _resolve_watermark(
+        config=config,
+        source_table=config.tables.source_table_name,
+        resolved_watermark=resolved_watermark,
+        is_multi_cf=False  # Single-CF mode
+    )
+    
     # Read with Auto Loader
     raw_df = _setup_autoloader(spark, source_path, checkpoint_path, config.tables.source_table_name)
     
@@ -450,7 +731,7 @@ def ingest_cdc_with_merge_single_family(
     print()
     
     # Transform: CockroachDB CDC → Standard CDC format
-    transformed_df = _transform_cdc_columns(raw_df)
+    transformed_df = _transform_cdc_columns(raw_df, resolved_watermark=resolved_watermark)
     
     print("✅ CDC transformations applied (streaming compatible)")
     print("   ℹ️  Deduplication will happen in Stage 2 (batch mode)")
@@ -897,7 +1178,8 @@ def merge_column_family_fragments(
 
 def ingest_cdc_append_only_multi_family(
     config,
-    spark
+    spark,
+    resolved_watermark: Optional[int] = None
 ):
     """
     Ingest CDC events in APPEND-ONLY mode with COLUMN FAMILY support.
@@ -922,6 +1204,10 @@ def ingest_cdc_append_only_multi_family(
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
+        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+                           If provided, uses this watermark (for multi-table coordination).
+                           If None, will compute from .RESOLVED files if enabled.
+                           CRITICAL for multi-CF: Ensures all fragments are complete.
     
     Returns:
         StreamingQuery object
@@ -937,6 +1223,14 @@ def ingest_cdc_append_only_multi_family(
     print(f"Primary keys: {primary_key_columns}")
     print()
     
+    # Resolve RESOLVED watermark (use provided or compute) - CRITICAL for column family completeness
+    resolved_watermark = _resolve_watermark(
+        config=config,
+        source_table=config.tables.source_table_name,
+        resolved_watermark=resolved_watermark,
+        is_multi_cf=True  # Multi-CF mode - CRITICAL for completeness
+    )
+    
     # Read with Auto Loader
     raw_df = _setup_autoloader(spark, source_path, checkpoint_path, config.tables.source_table_name)
     
@@ -944,7 +1238,8 @@ def ingest_cdc_append_only_multi_family(
     print()
     
     # Transform: CockroachDB CDC → Standard CDC format
-    transformed_df = _transform_cdc_columns(raw_df)
+    # Apply RESOLVED watermark if available (guarantees completeness)
+    transformed_df = _transform_cdc_columns(raw_df, resolved_watermark=resolved_watermark)
     
     print("✅ CDC transformations applied (streaming compatible)")
     print("   ℹ️  Column family merge will happen in Stage 2 (batch mode)")
@@ -997,7 +1292,8 @@ def ingest_cdc_append_only_multi_family(
 
 def ingest_cdc_with_merge_multi_family(
     config,
-    spark
+    spark,
+    resolved_watermark: Optional[int] = None
 ):
     """
     Ingest CDC events with MERGE logic and COLUMN FAMILY support.
@@ -1028,6 +1324,10 @@ def ingest_cdc_with_merge_multi_family(
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
+        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+                           If provided, uses this watermark (for multi-table coordination).
+                           If None, will compute from .RESOLVED files if enabled.
+                           CRITICAL for multi-CF: Ensures all fragments are complete.
     
     Returns:
         Dict with query, staging_table, target_table, raw_count, deduped_count, merged
@@ -1046,6 +1346,14 @@ def ingest_cdc_with_merge_multi_family(
     print(f"Primary keys: {primary_key_columns}")
     print()
     
+    # Resolve RESOLVED watermark (use provided or compute) - CRITICAL for column family completeness
+    resolved_watermark = _resolve_watermark(
+        config=config,
+        source_table=config.tables.source_table_name,
+        resolved_watermark=resolved_watermark,
+        is_multi_cf=True  # Multi-CF mode - CRITICAL for completeness
+    )
+    
     # Read with Auto Loader
     raw_df = _setup_autoloader(spark, source_path, checkpoint_path, config.tables.source_table_name)
     
@@ -1053,7 +1361,8 @@ def ingest_cdc_with_merge_multi_family(
     print()
     
     # Transform: CockroachDB CDC → Standard CDC format
-    transformed_df = _transform_cdc_columns(raw_df)
+    # Apply RESOLVED watermark if available (guarantees completeness)
+    transformed_df = _transform_cdc_columns(raw_df, resolved_watermark=resolved_watermark)
     
     print("✅ CDC transformations applied (streaming compatible)")
     print("   ℹ️  Column family merge will happen in Stage 2 (batch mode)")
