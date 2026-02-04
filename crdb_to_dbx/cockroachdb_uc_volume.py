@@ -33,7 +33,6 @@ def check_volume_files(
     source_table: str,
     target_table: str,
     spark,
-    dbutils,
     verbose: bool = True,
     format: str = "parquet"
 ) -> Dict[str, Any]:
@@ -50,7 +49,6 @@ def check_volume_files(
         source_table: Source table name
         target_table: Target table name
         spark: SparkSession (required for Unity Catalog operations)
-        dbutils: DBUtils instance (required for file system operations)
         verbose: Print detailed output
         format: Changefeed format (default: "parquet")
     
@@ -71,8 +69,7 @@ def check_volume_files(
         ...     source_schema="public",
         ...     source_table="usertable",
         ...     target_table="usertable_append_only",
-        ...     spark=spark,
-        ...     dbutils=dbutils
+        ...     spark=spark
         ... )
         >>> print(f"Found {len(result['data_files'])} data files")
     """
@@ -81,49 +78,57 @@ def check_volume_files(
     path_prefix = f"{format}/{source_catalog}/{source_schema}/{source_table}/{target_table}/"
     full_path = f"{volume_path.rstrip('/')}/{path_prefix}"
     
-    # List files recursively using dbutils
-    def list_recursive(path):
-        """Recursively list files in directory and subdirectories."""
-        files = []
-        try:
-            items = dbutils.fs.ls(path)
-            for item in items:
-                # Skip metadata directories
-                if '/_metadata/' in item.path:
-                    continue
-                
-                # Extract filename from path
-                item_name = item.name if item.name else item.path.rstrip('/').split('/')[-1]
-                
-                # Skip items starting with underscore (_SUCCESS, _committed_*, etc.)
-                if item_name.startswith('_'):
-                    continue
-                
-                # Check if it's a file by extension
-                is_data_file = item_name.endswith('.parquet') or item_name.endswith('.json') or item_name.endswith('.ndjson')
-                
-                if is_data_file:
-                    # Add file to list
-                    files.append({
-                        'name': item_name,
-                        'path': item.path,
-                        'size': item.size
-                    })
-                else:
-                    # Assume it's a directory, recurse into it
-                    files.extend(list_recursive(item.path))
-        except Exception:
-            # Directory might not exist or be accessible
-            pass
-        return files
+    # Use Spark to list files in parallel
+    if verbose:
+        print(f"   🚀 Using Spark for fast parallel file listing...")
+    
+    # Use Spark's file listing which is parallelized
+    from pyspark.sql.utils import AnalysisException
     
     try:
-        all_files = list_recursive(full_path)
-    except Exception as e:
         if verbose:
-            print(f"⚠️  Warning: Could not list files in volume path: {full_path}")
-            print(f"   Error: {e}")
+            print(f"   ⏳ Spark: Reading directory structure...")
+        
+        # Try to read the directory structure using Spark
+        file_df = spark.read.format("binaryFile").option("recursiveFileLookup", "true").load(full_path)
+        
+        if verbose:
+            print(f"   ⏳ Spark: Collecting file paths...")
+        
+        file_paths = [row.path for row in file_df.select("path").collect()]
+        
+        if verbose:
+            print(f"   ✅ Spark: Found {len(file_paths)} total paths")
+        
+        # Convert to file info dicts
         all_files = []
+        for path in file_paths:
+            filename = path.split('/')[-1]
+            
+            # Skip metadata directory and underscore files (but NOT .RESOLVED)
+            if '/_metadata/' in path or (filename.startswith('_') and '.RESOLVED' not in filename):
+                continue
+            
+            # Include data files AND .RESOLVED files
+            if (filename.endswith('.parquet') or filename.endswith('.json') or 
+                filename.endswith('.ndjson') or '.RESOLVED' in filename):
+                all_files.append({
+                    'name': filename,
+                    'path': path,
+                    'size': 0  # Size not available from binaryFile format
+                })
+                
+    except AnalysisException as e:
+        # Directory doesn't exist or is empty - treat as empty directory
+        if verbose:
+            print(f"   ℹ️  Directory not found or empty: {full_path}")
+        all_files = []
+    except Exception as e:
+        # Other errors - fail with exception
+        raise RuntimeError(
+            f"Failed to list files in Unity Catalog Volume path: {full_path}\n"
+            f"Error: {e}"
+        ) from e
     
     # Categorize files (same logic as Azure module)
     # Data files: .parquet/.json files, excluding:
@@ -165,7 +170,6 @@ def wait_for_changefeed_files(
     source_table: str,
     target_table: str,
     spark,
-    dbutils,
     max_wait: int = 120,
     check_interval: int = 5,
     stabilization_wait: Optional[int] = None,
@@ -197,7 +201,6 @@ def wait_for_changefeed_files(
         source_table: Source table name
         target_table: Target table name
         spark: SparkSession (required for Unity Catalog operations)
-        dbutils: DBUtils instance (required for file system operations)
         max_wait: Maximum seconds to wait for files (default: 120)
         check_interval: Seconds between checks (default: 5)
         stabilization_wait: Seconds to wait for file count to stabilize (default: None)
@@ -223,25 +226,12 @@ def wait_for_changefeed_files(
         ...     source_table="usertable",
         ...     target_table="usertable",
         ...     spark=spark,
-        ...     dbutils=dbutils,
         ...     max_wait=300,
         ...     wait_for_resolved=True  # ✅ Wait for RESOLVED
         ... )
         >>> if result['success']:
         ...     print(f"RESOLVED file: {result['resolved_file']}")
         ...     # Use for watermark coordination
-    
-    Example (Legacy mode):
-        >>> result = wait_for_changefeed_files(
-        ...     volume_path="/Volumes/main/default/cdc",
-        ...     source_catalog="defaultdb",
-        ...     source_schema="public",
-        ...     source_table="usertable",
-        ...     target_table="usertable",
-        ...     spark=spark,
-        ...     dbutils=dbutils,
-        ...     wait_for_resolved=False  # Legacy data file mode
-        ... )
     """
     if wait_for_resolved:
         # ====================================================================
@@ -257,7 +247,7 @@ def wait_for_changefeed_files(
         while elapsed < max_wait:
             result = check_volume_files(
                 volume_path, source_catalog, source_schema, source_table, target_table,
-                spark, dbutils, verbose=False, format=format
+                spark, verbose=False, format=format
             )
             
             resolved_files = result['resolved_files']
@@ -317,7 +307,7 @@ def wait_for_changefeed_files(
         while elapsed < max_wait:
             result = check_volume_files(
                 volume_path, source_catalog, source_schema, source_table, target_table,
-                spark, dbutils, verbose=False, format=format
+                spark, verbose=False, format=format
             )
             
             current_file_count = len(result['data_files'])

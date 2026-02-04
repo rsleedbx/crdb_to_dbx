@@ -6,9 +6,14 @@ useful for continuous validation and stress testing.
 
 The loop executes:
 1. Generate workload (INSERT/UPDATE/DELETE)
-2. Wait for CDC files in Azure
+2. Wait for CDC files in storage (Azure or UC Volume)
 3. Ingest CDC data to Databricks
 4. Run validation diagnosis
+
+Storage Support:
+- Azure Blob Storage
+- Unity Catalog External Volumes
+- Automatically switches based on config.data_source
 
 Usage:
     from cockroachdb_testloop import run_cdc_test_loop
@@ -39,11 +44,13 @@ def run_cdc_test_loop(
     
     This function executes a complete CDC cycle repeatedly:
     1. Generate workload (INSERT/UPDATE/DELETE operations)
-    2. Wait for CDC files to appear in Azure
+    2. Wait for CDC files to appear in storage (Azure or UC Volume)
     3. Ingest CDC data to Databricks
     4. Run validation diagnosis (optional)
     
     The loop runs either for a specified number of iterations or duration.
+    Automatically switches between Azure Blob Storage and Unity Catalog External
+    Volume based on config.data_source.
     
     Args:
         spark: Spark session
@@ -69,23 +76,30 @@ def run_cdc_test_loop(
     
     Example:
         >>> # Run 10 iterations (creates connections as needed)
-        >>> stats = run_cdc_test_loop(spark=spark, config=config, iterations=10)
+        >>> stats = run_cdc_test_loop(
+        ...     spark=spark, config=config, iterations=10
+        ... )
         >>> print(f"Completed {stats['successful_iterations']}/{stats['total_iterations']}")
         
         >>> # Run for 10 minutes
-        >>> stats = run_cdc_test_loop(spark=spark, config=config, duration_minutes=10)
+        >>> stats = run_cdc_test_loop(
+        ...     spark=spark, config=config, duration_minutes=10
+        ... )
         
         >>> # Run with reusable connection (more efficient)
         >>> from cockroachdb_conn import get_cockroachdb_connection_native
         >>> conn = get_cockroachdb_connection_native(...)
         >>> try:
-        ...     stats = run_cdc_test_loop(spark=spark, config=config, iterations=10, conn=conn)
+        ...     stats = run_cdc_test_loop(
+        ...         spark=spark, config=config, 
+        ...         iterations=10, conn=conn
+        ...     )
         ... finally:
         ...     conn.close()
         
         >>> # Run 5 iterations without validation (faster)
         >>> stats = run_cdc_test_loop(
-        ...     spark=spark, config=config, 
+        ...     spark=spark, config=config,
         ...     iterations=5, skip_validation=True
         ... )
     """
@@ -97,7 +111,7 @@ def run_cdc_test_loop(
     
     # Import dependencies
     from cockroachdb_conn import get_cockroachdb_connection, get_cockroachdb_connection_native
-    from cockroachdb_azure import check_azure_files
+    from cockroachdb_storage import check_files  # Storage-agnostic (Azure + UC Volume)
     from cockroachdb_ycsb import run_ycsb_workload_with_random_nulls
     from cockroachdb_autoload import (
         ingest_cdc_append_only_single_family,
@@ -140,6 +154,7 @@ def run_cdc_test_loop(
         print("✅ Connection ready for all iterations\n")
     
     # Print header
+    storage_label = "Unity Catalog Volume" if config.data_source == "uc_external_volume" else "Azure"
     print("=" * 80)
     print("🔄 CDC TEST LOOP STARTING")
     print("=" * 80)
@@ -147,6 +162,7 @@ def run_cdc_test_loop(
         print(f"   Mode: {iterations} iterations")
     else:
         print(f"   Mode: {duration_minutes} minutes ({end_time.strftime('%H:%M:%S')} end time)")
+    print(f"   Storage: {storage_label}")
     print(f"   CDC Mode: {config.cdc_config.mode}")
     print(f"   Column Family Mode: {config.cdc_config.column_family_mode}")
     print(f"   Validation: {'Disabled' if skip_validation else 'Enabled'}")
@@ -188,19 +204,14 @@ def run_cdc_test_loop(
                 print(f"\n📝 Step 1: Generating workload...")
                 
                 # Capture baseline file count
-                result_before = check_azure_files(
-                    config.azure_storage.account_name,
-                    config.azure_storage.account_key,
-                    config.azure_storage.container_name,
-                    config.tables.source_catalog,
-                    config.tables.source_schema,
-                    config.tables.source_table_name,
-                    config.tables.destination_table_name,
-                    verbose=False,
-                    format=config.cdc_config.format
+                result_before = check_files(
+                    config=config,
+                    spark=spark,
+                    verbose=False
                 )
                 files_before = len(result_before['data_files'])
-                print(f"   Baseline: {files_before} CDC files in Azure")
+                resolved_before = len(result_before['resolved_files'])
+                print(f"   Baseline: {files_before} data files, {resolved_before} resolved files in {storage_label}")
                 
                 # Run workload using the loop's connection
                 run_ycsb_workload_with_random_nulls(
@@ -224,29 +235,25 @@ def run_cdc_test_loop(
                 # ================================================================
                 # STEP 2: WAIT FOR CDC FILES
                 # ================================================================
-                print(f"\n⏳ Step 2: Waiting for CDC files (timeout: {wait_for_files_timeout}s)...")
+                print(f"\n⏳ Step 2: Waiting for CDC files in {storage_label} (timeout: {wait_for_files_timeout}s)...")
                 
                 check_interval = 10
                 elapsed = 0
                 files_appeared = False
                 
                 while elapsed < wait_for_files_timeout:
-                    result = check_azure_files(
-                        config.azure_storage.account_name,
-                        config.azure_storage.account_key,
-                        config.azure_storage.container_name,
-                        config.tables.source_catalog,
-                        config.tables.source_schema,
-                        config.tables.source_table_name,
-                        config.tables.destination_table_name,
-                        verbose=False,
-                        format=config.cdc_config.format
+                    result = check_files(
+                        config=config,
+                        spark=spark,
+                        verbose=False
                     )
                     files_now = len(result['data_files'])
+                    resolved_now = len(result['resolved_files'])
                     
-                    if files_now > files_before:
+                    if files_now > files_before or resolved_now > resolved_before:
                         print(f"   ✅ CDC files appeared after {elapsed}s")
-                        print(f"      Before: {files_before} files | After: {files_now} files | New: {files_now - files_before}")
+                        print(f"      Data files: {files_before} → {files_now} (+{files_now - files_before})")
+                        print(f"      Resolved files: {resolved_before} → {resolved_now} (+{resolved_now - resolved_before})")
                         files_appeared = True
                         break
                     
@@ -259,64 +266,34 @@ def run_cdc_test_loop(
                 # ================================================================
                 # STEP 3: INGEST CDC DATA
                 # ================================================================
-                print(f"\n📥 Step 3: Ingesting CDC data...")
+                print(f"\n📥 Step 3: Ingesting CDC data from {storage_label}...")
                 print(f"   Mode: {config.cdc_config.mode} + {config.cdc_config.column_family_mode}")
                 
                 # Select appropriate ingestion function
+                # All functions now use config-based approach (no individual storage params)
                 if config.cdc_config.mode == "append_only" and config.cdc_config.column_family_mode == "single_cf":
                     query = ingest_cdc_append_only_single_family(
-                        storage_account_name=config.azure_storage.account_name,
-                        container_name=config.azure_storage.container_name,
-                        source_catalog=config.tables.source_catalog,
-                        source_schema=config.tables.source_schema,
-                        source_table=config.tables.source_table_name,
-                        target_catalog=config.tables.destination_catalog,
-                        target_schema=config.tables.destination_schema,
-                        target_table=config.tables.destination_table_name,
+                        config=config,
                         spark=spark
                     )
                     query.awaitTermination()
                     
                 elif config.cdc_config.mode == "append_only" and config.cdc_config.column_family_mode == "multi_cf":
                     query = ingest_cdc_append_only_multi_family(
-                        storage_account_name=config.azure_storage.account_name,
-                        container_name=config.azure_storage.container_name,
-                        source_catalog=config.tables.source_catalog,
-                        source_schema=config.tables.source_schema,
-                        source_table=config.tables.source_table_name,
-                        target_catalog=config.tables.destination_catalog,
-                        target_schema=config.tables.destination_schema,
-                        target_table=config.tables.destination_table_name,
-                        primary_key_columns=config.cdc_config.primary_key_columns,
+                        config=config,
                         spark=spark
                     )
                     query.awaitTermination()
                     
                 elif config.cdc_config.mode == "update_delete" and config.cdc_config.column_family_mode == "single_cf":
                     result = ingest_cdc_with_merge_single_family(
-                        storage_account_name=config.azure_storage.account_name,
-                        container_name=config.azure_storage.container_name,
-                        source_catalog=config.tables.source_catalog,
-                        source_schema=config.tables.source_schema,
-                        source_table=config.tables.source_table_name,
-                        target_catalog=config.tables.destination_catalog,
-                        target_schema=config.tables.destination_schema,
-                        target_table=config.tables.destination_table_name,
-                        primary_key_columns=config.cdc_config.primary_key_columns,
+                        config=config,
                         spark=spark
                     )
                     
                 elif config.cdc_config.mode == "update_delete" and config.cdc_config.column_family_mode == "multi_cf":
                     result = ingest_cdc_with_merge_multi_family(
-                        storage_account_name=config.azure_storage.account_name,
-                        container_name=config.azure_storage.container_name,
-                        source_catalog=config.tables.source_catalog,
-                        source_schema=config.tables.source_schema,
-                        source_table=config.tables.source_table_name,
-                        target_catalog=config.tables.destination_catalog,
-                        target_schema=config.tables.destination_schema,
-                        target_table=config.tables.destination_table_name,
-                        primary_key_columns=config.cdc_config.primary_key_columns,
+                        config=config,
                         spark=spark
                     )
                 else:

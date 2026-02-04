@@ -19,7 +19,7 @@ Available Functions:
     Analysis Functions:
         • analyze_cdc_events_by_column_family() - Analyze CDC event distribution
         • check_merge_completeness() - Check staging table merge status
-        • check_staging_and_azure_for_keys() - Check specific keys in staging/Azure
+        • check_staging_and_storage_for_keys() - Check specific keys in staging/storage
         • inspect_raw_cdc_files() - Inspect raw CDC files for specific keys
     
     Helper Functions:
@@ -38,7 +38,7 @@ Usage in notebook:
     
     # Full diagnosis
     run_full_diagnosis(conn, spark, source_table, target_df, staging_table,
-                       azure_path, primary_keys, mismatched_columns)
+                       storage_path, primary_keys, mismatched_columns, storage_type)
 """
 
 import pg8000.native
@@ -121,6 +121,7 @@ def get_column_families(conn, table_name: str) -> Dict[str, List[str]]:
     
     try:
         rows = conn.run(query)
+        conn.commit()  # Close read transaction
         # Return all columns as part of 'default' family for simplicity
         # In reality, column families would need SHOW CREATE TABLE parsing
         return {'default': [row[0] for row in rows]}
@@ -185,6 +186,7 @@ def find_mismatched_rows(
     # Select only those columns from source
     column_list = ', '.join(target_columns)
     source_rows = conn.run(f"SELECT {column_list} FROM {source_table} ORDER BY {', '.join(primary_keys)}")
+    conn.commit()  # Close read transaction
     
     # Get column names from first row (if any)
     if not source_rows:
@@ -350,6 +352,7 @@ def compare_row_by_row(
     pk_list = ", ".join(primary_keys)
     source_keys_query = f"SELECT {pk_list} FROM {source_table} LIMIT {limit}"
     source_keys_result = conn.run(source_keys_query)
+    conn.commit()  # Close read transaction
     
     if not source_keys_result:
         print("\n⚠️  No rows found in source table")
@@ -365,6 +368,7 @@ def compare_row_by_row(
         
         # pg8000.native uses connection directly (no cursor)
         result = conn.run(source_query)
+        conn.commit()  # Close read transaction
         source_row = result[0] if result else None
         
         # Get target row (latest for append_only mode)
@@ -432,24 +436,30 @@ def compare_row_by_row(
 
 def analyze_cdc_events_by_column_family(
     spark,
-    azure_path: str,
+    storage_path: str,
     table_name: str,
-    primary_keys: List[str]
+    primary_keys: List[str],
+    storage_type: str = "azure"
 ) -> None:
     """
-    Analyze CDC events from Azure to check column family fragment distribution.
+    Analyze CDC events from storage to check column family fragment distribution.
+    
+    Supports both Azure Blob Storage and Unity Catalog External Volumes.
     
     Args:
         spark: Spark session
-        azure_path: Path to Azure changefeed files
+        storage_path: Path to changefeed files (Azure or UC Volume)
         table_name: Table name to filter
         primary_keys: List of primary key columns
+        storage_type: Type of storage ("azure" or "uc_volume")
     """
+    storage_label = "Unity Catalog Volume" if storage_type == "uc_volume" else "Azure"
+    
     print("=" * 80)
     print("CDC EVENT ANALYSIS (Column Family Distribution)")
     print("=" * 80)
     
-    print(f"\n📁 Azure path: {azure_path}")
+    print(f"\n📁 Storage path ({storage_label}): {storage_path}")
     
     try:
         # Use batch read with pathGlobFilter (same pattern as notebook's Auto Loader)
@@ -460,7 +470,7 @@ def analyze_cdc_events_by_column_family(
             .option("pathGlobFilter", f"*{table_name}*.parquet")  # Match notebook pattern
             .option("recursiveFileLookup", "true")
             .option("mergeSchema", "true")  # ← Merge schemas from all column families
-            .load(azure_path)
+            .load(storage_path)
         )
         
         print(f"✅ Schema inferred from Parquet files")
@@ -714,38 +724,47 @@ def diagnose_column_family_sync(
         print(f"\n  ✅ No mismatches reported")
 
 
-def check_staging_and_azure_for_keys(
+def check_staging_and_storage_for_keys(
     spark,
     staging_table: str,
-    azure_path: str,
+    storage_path: str,
     table_name: str,
     primary_keys: List[str],
     mismatched_keys: List[Any],
-    columns_to_check: List[str]
+    columns_to_check: List[str],
+    storage_type: str = "azure"
 ) -> bool:
     """
-    Check if specific keys exist in the staging table or raw Azure CDC files.
+    Check if specific keys exist in the staging table or raw CDC files in storage.
+    
+    Supports both Azure Blob Storage and Unity Catalog External Volumes.
     
     Returns:
         bool: True if the mismatched data was found in staging (MERGE issue),
-              False if data is missing from Azure (changefeed issue)
+              False if data is missing from storage (changefeed issue)
     
     Args:
         spark: Spark session
         staging_table: Fully qualified staging table name
-        azure_path: Path to Azure CDC files
+        storage_path: Path to CDC files (Azure abfss:// or UC Volume /Volumes/)
         table_name: Table name (for file filtering)
         primary_keys: List of primary key column names
         mismatched_keys: List of primary key values that are mismatched
         columns_to_check: List of columns to display
+        storage_type: "azure" or "uc_volume" (default: "azure")
     """
     from pyspark.sql import functions as F
     
+    storage_label = "Unity Catalog Volume" if storage_type == "uc_volume" else "Azure"
+    
     print("=" * 80)
-    print("STAGING & AZURE CHECK (for mismatched keys)")
+    print(f"STAGING & STORAGE CHECK (for mismatched keys)")
     print("=" * 80)
     
-    print(f"\n🔑 Mismatched keys: {mismatched_keys}")
+    # Convert mismatched_keys to Python native types (avoid Spark/numpy types)
+    mismatched_keys_native = [int(k) if hasattr(k, '__int__') else k for k in mismatched_keys]
+    
+    print(f"\n🔑 Mismatched keys: {mismatched_keys_native}")
     
     data_found_in_staging = False
     
@@ -759,8 +778,8 @@ def check_staging_and_azure_for_keys(
         if current_count > 0:
             print(f"   🔍 Checking for mismatched keys in staging...")
             
-            # Filter for mismatched keys
-            key_filter = F.col(primary_keys[0]).isin(mismatched_keys)
+            # Filter for mismatched keys (use native Python types)
+            key_filter = F.col(primary_keys[0]).isin(mismatched_keys_native)
             matched_rows = staging_df.filter(key_filter)
             matched_count = matched_rows.count()
             
@@ -784,8 +803,8 @@ def check_staging_and_azure_for_keys(
     except Exception as e:
         print(f"   ❌ Error checking staging: {e}")
     
-    # 2. Check raw Azure CDC files
-    print(f"\n📁 Checking raw Azure CDC files...")
+    # 2. Check raw CDC files in storage
+    print(f"\n📁 Checking raw CDC files in {storage_label}...")
     
     try:
         # Read raw Parquet files (same pattern as CDC analysis)
@@ -795,21 +814,21 @@ def check_staging_and_azure_for_keys(
             .option("pathGlobFilter", f"*{table_name}*.parquet")
             .option("recursiveFileLookup", "true")
             .option("mergeSchema", "true")  # ← Merge schemas from all column families
-            .load(azure_path)
+            .load(storage_path)
         )
         
         total_events = df_raw.count()
-        print(f"   Total CDC events in Azure: {total_events:,}")
+        print(f"   Total CDC events in {storage_label}: {total_events:,}")
         print(f"   📋 Columns detected: {len(df_raw.columns)} columns")
         print(f"      {', '.join([c for c in df_raw.columns if not c.startswith('_')])}")
         
-        # Filter for mismatched keys
-        key_filter = F.col(primary_keys[0]).isin(mismatched_keys)
+        # Filter for mismatched keys (use native Python types)
+        key_filter = F.col(primary_keys[0]).isin(mismatched_keys_native)
         matched_events = df_raw.filter(key_filter)
         matched_count = matched_events.count()
         
         if matched_count > 0:
-            print(f"   ✅ Found {matched_count} CDC events for these keys in Azure:")
+            print(f"   ✅ Found {matched_count} CDC events for these keys in {storage_label}:")
             
             # Show ALL columns in the raw events (including NULLs) to see column family fragments
             print(f"\n   📊 All {matched_count} events for key(s) {mismatched_keys}:")
@@ -832,16 +851,16 @@ def check_staging_and_azure_for_keys(
                            matched_events.filter(F.col(col).isNotNull()).count() == 0]
             if missing_cols:
                 print(f"\n   💡 Analysis:")
-                print(f"      • {len(missing_cols)} mismatched columns have NO events with values in Azure")
+                print(f"      • {len(missing_cols)} mismatched columns have NO events with values in {storage_label}")
                 print(f"      • Missing columns: {', '.join(missing_cols[:5])}")
-                print(f"      • This suggests the column family fragment for these columns never made it to Azure")
+                print(f"      • This suggests the column family fragment for these columns never made it to {storage_label}")
                 print(f"      • Likely cause: Changefeed didn't capture the INSERT for this column family")
         else:
-            print(f"   ⚠️  No CDC events found for these keys in Azure!")
+            print(f"   ⚠️  No CDC events found for these keys in {storage_label}!")
             print(f"   💡 This suggests the changefeed may not have captured these events")
         
     except Exception as e:
-        print(f"   ❌ Error checking Azure files: {e}")
+        print(f"   ❌ Error checking storage files: {e}")
         import traceback
         traceback.print_exc()
     
@@ -850,23 +869,29 @@ def check_staging_and_azure_for_keys(
 
 def inspect_raw_cdc_files(
     spark,
-    azure_path: str,
+    storage_path: str,
     primary_key: str,
     key_value: Any,
-    show_content: bool = True
+    show_content: bool = True,
+    storage_type: str = "azure"
 ) -> None:
     """
     Inspect raw CDC files for a specific key to see all fragments.
     
+    Supports both Azure Blob Storage and Unity Catalog External Volumes.
+    
     Args:
         spark: Spark session
-        azure_path: Path to Azure changefeed files
+        storage_path: Path to changefeed files (Azure or UC Volume)
         primary_key: Primary key column name
         key_value: Specific key value to inspect
         show_content: Whether to show full column values
+        storage_type: Type of storage ("azure" or "uc_volume")
     """
+    storage_label = "Unity Catalog Volume" if storage_type == "uc_volume" else "Azure"
+    
     print("=" * 80)
-    print(f"RAW CDC FILE INSPECTION (Key: {primary_key}={key_value})")
+    print(f"RAW CDC FILE INSPECTION ({storage_label}, Key: {primary_key}={key_value})")
     print("=" * 80)
     
     try:
@@ -874,7 +899,7 @@ def inspect_raw_cdc_files(
         df_raw = (spark.read
             .format("parquet")
             .option("mergeSchema", "true")
-            .load(azure_path)
+            .load(storage_path)
         )
         df_key = df_raw.filter(F.col(primary_key) == key_value)
         
@@ -921,9 +946,10 @@ def run_full_diagnosis(
     source_table: str,
     target_df: DataFrame,
     staging_table: str,
-    azure_path: str,
+    storage_path: str,
     primary_keys: List[str],
-    mismatched_columns: List[str]
+    mismatched_columns: List[str],
+    storage_type: str = "azure"
 ) -> None:
     """
     Run comprehensive diagnosis of CDC sync issues.
@@ -932,15 +958,18 @@ def run_full_diagnosis(
     - If staging_table exists → update_delete mode (two-stage ingestion)
     - If staging_table is None → append_only mode (direct ingestion)
     
+    Supports both Azure Blob Storage and Unity Catalog External Volumes.
+    
     Args:
         conn: CockroachDB connection
         spark: Spark session
         source_table: Source table name
         target_df: Target Spark DataFrame
         staging_table: Staging table name (None for append_only mode)
-        azure_path: Azure changefeed path
+        storage_path: Path to changefeed files (Azure or UC Volume)
         primary_keys: List of primary key columns
         mismatched_columns: Columns with sum mismatches
+        storage_type: Type of storage ("azure" or "uc_volume")
     """
     # Clear any aborted transaction state from previous errors
     try:
@@ -976,10 +1005,10 @@ def run_full_diagnosis(
         check_merge_completeness(spark, staging_table, primary_keys)
     
     # 3. Analyze raw CDC events
-    if azure_path:
+    if storage_path:
         # Extract just the table name from fully qualified name (e.g., "catalog.schema.table" -> "table")
         table_name = source_table.split('.')[-1] if '.' in source_table else source_table
-        analyze_cdc_events_by_column_family(spark, azure_path, table_name, primary_keys)
+        analyze_cdc_events_by_column_family(spark, storage_path, table_name, primary_keys, storage_type)
     
     # 4. Detailed mismatch analysis (if mismatches were reported)
     actual_mismatch_found = False
@@ -992,14 +1021,16 @@ def run_full_diagnosis(
             is_append_only=is_append_only
         )
         
-        # For append_only mode: Check Azure for missing source keys
-        if actual_mismatch_found and is_append_only and azure_path:
+        # For append_only mode: Check storage for missing source keys
+        storage_label = "Unity Catalog Volume" if storage_type == "uc_volume" else "Azure"
+        if actual_mismatch_found and is_append_only and storage_path:
             print(f"\n")
-            print(f"🔍 Investigating missing source keys in Azure CDC files...")
+            print(f"🔍 Investigating missing source keys in {storage_label} CDC files...")
             
             # Get source keys that are missing from target
             source_df_cols = ', '.join(primary_keys)
             source_rows = conn.run(f"SELECT {source_df_cols} FROM {source_table}")
+            conn.commit()  # Close read transaction
             from pyspark.sql.types import StructType
             pk_schema = StructType([field for field in target_df.schema.fields if field.name in primary_keys])
             source_keys_df = spark.createDataFrame(source_rows, schema=pk_schema)
@@ -1012,14 +1043,15 @@ def run_full_diagnosis(
                 print(f"   Found {len(missing_source_keys)} source keys missing from target")
                 print(f"   Missing keys: {missing_source_keys[:20]}")  # Show first 20
                 
-                # Check Azure for these missing keys
+                # Check storage for these missing keys
                 table_name = source_table.split('.')[-1]
-                check_staging_and_azure_for_keys(
-                    spark, None, azure_path, table_name,
-                    primary_keys, missing_source_keys[:10], mismatched_columns  # Check first 10 keys
+                check_staging_and_storage_for_keys(
+                    spark, None, storage_path, table_name,
+                    primary_keys, missing_source_keys[:10], mismatched_columns,  # Check first 10 keys
+                    storage_type=storage_type
                 )
         
-        # For update_delete mode: Check if mismatched keys exist in staging or Azure
+        # For update_delete mode: Check if mismatched keys exist in staging or storage
         elif actual_mismatch_found and staging_table:
             # Get the mismatched keys from target (filter by NULL in mismatched columns)
             from pyspark.sql import functions as F
@@ -1033,10 +1065,13 @@ def run_full_diagnosis(
             
             if mismatched_keys:
                 print(f"\n")
-                print(f"🔍 Checking if mismatched keys ({len(mismatched_keys)} keys) exist in staging/Azure...")
-                data_in_staging = check_staging_and_azure_for_keys(spark, staging_table, azure_path, 
-                                                  source_table.split('.')[-1], 
-                                                  primary_keys, mismatched_keys, mismatched_columns)
+                print(f"🔍 Checking if mismatched keys ({len(mismatched_keys)} keys) exist in staging/storage...")
+                data_in_staging = check_staging_and_storage_for_keys(
+                    spark, staging_table, storage_path, 
+                    source_table.split('.')[-1], 
+                    primary_keys, mismatched_keys, mismatched_columns,
+                    storage_type=storage_type
+                )
     
     # 5. Summary and interpretation
     print("\n" + "=" * 80)
@@ -1058,8 +1093,8 @@ def run_full_diagnosis(
             print(f"    • Check CockroachDB changefeed status (look for errors)")
             print(f"    • Re-run ingestion pipeline (Cell 12) - Auto Loader may not have processed all files yet")
             print(f"    • If problem persists:")
-            print(f"      1. Complete reset: Drop changefeed, clear Azure, clear target, recreate")
-            print(f"      2. Check Azure for presence of CDC files for missing keys")
+            print(f"      1. Complete reset: Drop changefeed, clear {storage_label}, clear target, recreate")
+            print(f"      2. Check {storage_label} for presence of CDC files for missing keys")
             print(f"      3. Verify changefeed is still running in CockroachDB")
         else:
             print(f"\n💡 Root Cause (Column Family Issue):")
@@ -1081,7 +1116,7 @@ def run_full_diagnosis(
                     print(f"    • ❌ Changefeed didn't capture the column family fragment")
                     print(f"\n🔧 Recommended Fix:")
                     print(f"    • Issue: Changefeed failed to capture field3-9 column family for some rows")
-                    print(f"    • Solution 1: Complete reset - drop changefeed, clear Azure, recreate")
+                    print(f"    • Solution 1: Complete reset - drop changefeed, clear {storage_label}, recreate")
                     print(f"    • Solution 2: Manual backfill for affected keys (see ROW_112_DIAGNOSIS.md)")
                     print(f"    • Solution 3: Check CockroachDB changefeed logs for errors")
             else:
@@ -1283,7 +1318,7 @@ def run_full_diagnosis_from_config(
     SECTION 3: Detailed Diagnosis (Only if issues found)
     - Runs comprehensive diagnosis if any discrepancies detected
     - Analyzes column families and sync status
-    - Checks CDC event distribution in Azure
+    - Checks CDC event distribution in storage
     - Performs row-by-row comparison
     - Provides troubleshooting recommendations
     
@@ -1296,7 +1331,9 @@ def run_full_diagnosis_from_config(
         config: Config dataclass from cockroachdb_config.py with:
             - cockroachdb: CockroachDBConfig (host, port, database, user, password)
             - tables: TableConfig (source_catalog, source_schema, source_table_name, etc.)
-            - azure_storage: AzureStorageConfig (account_name, container_name)
+            - data_source: str ("azure" or "uc_external_volume")
+            - azure_storage: AzureStorageConfig (if data_source is "azure")
+            - uc_volume: UCVolumeConfig (if data_source is "uc_external_volume")
             - cdc_config: CDCConfig (primary_key_columns, mode, column_family_mode)
         conn: Optional pg8000.native.Connection - If provided, uses this connection.
               If None, creates a new connection (default: None)
@@ -1343,16 +1380,19 @@ def run_full_diagnosis_from_config(
     target_schema = config.tables.destination_schema
     target_table = config.tables.destination_table_name
     
-    # Extract config - Azure storage
-    storage_account_name = config.azure_storage.account_name
-    container_name = config.azure_storage.container_name
-    
     # Extract config - CDC settings
     primary_keys = config.cdc_config.primary_key_columns
     
+    # Get storage path based on data source
+    from cockroachdb_config import get_storage_path
+    storage_cdc_path = get_storage_path(config)
+    
+    # Determine storage type
+    storage_type = "uc_volume" if config.data_source == "uc_external_volume" else "azure"
+    storage_label = "Unity Catalog Volume" if storage_type == "uc_volume" else "Azure Blob Storage"
+    
     # Construct paths
     target_table_fqn = f"{target_catalog}.{target_schema}.{target_table}"
-    azure_cdc_path = f"abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/parquet/{source_catalog}/{source_schema}/{source_table}/{target_table}"
     staging_table = f"{target_catalog}.{target_schema}.{target_table}_staging_cf"
     
     # Print configuration
@@ -1362,7 +1402,8 @@ def run_full_diagnosis_from_config(
     print(f"   Source: {source_catalog}.{source_schema}.{source_table}")
     print(f"   Target: {target_table_fqn}")
     print(f"   Staging: {staging_table}")
-    print(f"   Azure: {azure_cdc_path[:80]}...")
+    print(f"   Storage: {storage_label}")
+    print(f"   Path: {storage_cdc_path[:80]}...")
     if mismatched_columns:
         print(f"   Mismatched columns: {len(mismatched_columns)} columns")
     print()
@@ -1482,6 +1523,7 @@ def run_full_diagnosis_from_config(
             print(f"\n   Step 2: Filtering to source keys only for comparison...")
             source_keys_query = f"SELECT ycsb_key FROM {source_table_fqn}"
             source_keys_result = conn.run(source_keys_query)
+            conn.commit()  # Close read transaction
             source_keys = [row[0] for row in source_keys_result]
             
             target_df_for_comparison = target_df_deduplicated.filter(
@@ -1652,9 +1694,10 @@ def run_full_diagnosis_from_config(
             source_table=f"{source_catalog}.{source_schema}.{source_table}",
             target_df=target_df,
             staging_table=staging_table,
-            azure_path=azure_cdc_path,
+            storage_path=storage_cdc_path,
             primary_keys=primary_keys,
-            mismatched_columns=mismatched_columns or []
+            mismatched_columns=mismatched_columns or [],
+            storage_type=storage_type
         )
         
         # After detailed diagnosis, raise exception with validation failure details

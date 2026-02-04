@@ -1,6 +1,6 @@
 # Stream a CockroachDB Changefeed to Databricks (Azure Edition)
 
-*By Robert Lee | January 30, 2026*
+*By Robert Lee | Updated February 4, 2026*
 
 ---
 
@@ -78,6 +78,10 @@ Configure Unity Catalog to access your Azure storage account using external loca
 
 See [Connect to cloud object storage using Unity Catalog](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/) for setup instructions.
 
+**Alternative: Unity Catalog External Volumes**
+
+You can also access the same Azure storage through Unity Catalog External Volumes, which provides governed access without managing credentials in code. The connector supports both modes via configuration. See [STORAGE_PROVIDERS.md](./STORAGE_PROVIDERS.md) for configuration details.
+
 ### Step 5. Stream into Databricks Delta Lake *(Databricks)*
 
 Use Databricks Auto Loader to automatically ingest CDC files:
@@ -150,18 +154,63 @@ With support for both standard tables and tables with column families (for write
 ## Architecture
 
 ```
-                 ┌─────────────┐
-                 │ Changefeed  │
-                 └──────┬──────┘
-                        ↓
-CockroachDB ──→ Azure Blob Storage ──→ Databricks Auto Loader ──→ Delta Lake
-                (ADLS Gen2)               ↑
-                                          │
-                                   ┌──────┴───────┐
-                                   │Unity Catalog │
-                                   │ (Security &  │
-                                   │ Governance)  │
-                                   └──────────────┘
+┌───────────────────────────────────────┐
+│         CockroachDB Cluster           │
+│                                       │
+│  CREATE CHANGEFEED FOR TABLE ...     │
+│  INTO 'azure://...'                   │
+│  WITH format='parquet', resolved      │
+└──────────────┬────────────────────────┘
+               │
+               │ CDC Events (Parquet)
+               ↓
+┌───────────────────────────────────────┐
+│      Azure Blob Storage (ADLS Gen2)   │
+│                                       │
+│  changefeed-events/                   │
+│    └─ parquet/                        │
+│       └─ catalog/schema/table/        │
+│          ├─ data.parquet              │
+│          └─ .RESOLVED                 │
+└──────────────┬────────────────────────┘
+               │
+               │ Governed Access
+               ↓
+┌───────────────────────────────────────┐
+│         Unity Catalog                 │
+│                                       │
+│  Access Control Options:              │
+│  • External Locations (direct)        │
+│  • External Volumes (governed)        │
+│                                       │
+│  Security & Governance Layer          │
+└──────────────┬────────────────────────┘
+               │
+               │ Authorized Access
+               ↓
+┌───────────────────────────────────────┐
+│      Databricks Auto Loader           │
+│                                       │
+│  .format("cloudFiles")                │
+│  .option("cloudFiles.format","parquet")│
+│  .load("abfss://..." or "/Volumes/...")│
+│                                       │
+│  • Automatic file discovery           │
+│  • Schema inference & evolution       │
+│  • Exactly-once semantics             │
+└──────────────┬────────────────────────┘
+               │
+               │ Streaming DataFrame
+               ↓
+┌───────────────────────────────────────┐
+│          Delta Lake Table             │
+│                                       │
+│  • ACID transactions                  │
+│  • Time travel                        │
+│  • Schema evolution                   │
+│  • MERGE support (SCD Type 1)         │
+│  • Append-only (SCD Type 2)           │
+└───────────────────────────────────────┘
 ```
 
 ---
@@ -268,8 +317,8 @@ from crdb_to_dbx import ingest_cdc_with_merge_multi_family
 result = ingest_cdc_with_merge_multi_family(
     config=config,
     spark=spark
-    # Automatically uses latest RESOLVED timestamp for filtering
 )
+# Automatically uses latest RESOLVED timestamp for filtering
 ```
 
 **What happens:**
@@ -297,8 +346,15 @@ For multi-table coordination, column family details, and advanced usage, see the
 
 **Author**: [Robert Lee](https://credentials.databricks.com/profile/robertlee941580/wallet), Field Engineer at Databricks
 
-This guide was created with guidance from [Andrew Deally](https://andrewdeally.medium.com/).
+This guide was created with guidance from:
+- [Andrew Deally](https://andrewdeally.medium.com/) - CockroachDB team for changefeed architecture and best practices
 
 ---
 
+## License & Contributing
+
 **License**: Apache 2.0
+
+We welcome contributions to this CockroachDB CDC to Databricks connector. We use GitHub Issues to track community reported issues and GitHub Pull Requests for accepting changes.
+
+See [LICENSE](../LICENSE) for the full Apache 2.0 license text.

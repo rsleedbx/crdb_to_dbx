@@ -60,19 +60,30 @@ def check_azure_files(
     # List all blobs recursively (no date filtering)
     blobs = list(container_client.list_blobs(name_starts_with=prefix))
     
+    # Convert blobs to standard dict format (same as UC Volume)
+    # This ensures consistent format across all storage backends
+    all_files = [
+        {
+            'name': b.name,
+            'path': b.name,  # Azure blobs use 'name' as the full path
+            'size': b.size
+        }
+        for b in blobs
+    ]
+    
     # Categorize files (using same filtering logic as cockroachdb.py)
     # Data files: .parquet files, excluding:
     #   - .RESOLVED files (CDC watermarks)
     #   - _metadata/ directory (schema files)
     #   - Files starting with _ (_SUCCESS, _committed_*, etc.)
     data_files = [
-        b for b in blobs 
-        if b.name.endswith('.parquet') 
-        and '.RESOLVED' not in b.name
-        and '/_metadata/' not in b.name
-        and not b.name.split('/')[-1].startswith('_')
+        f for f in all_files 
+        if f['name'].endswith('.parquet') 
+        and '.RESOLVED' not in f['name']
+        and '/_metadata/' not in f['name']
+        and not f['name'].split('/')[-1].startswith('_')
     ]
-    resolved_files = [b for b in blobs if '.RESOLVED' in b.name]
+    resolved_files = [f for f in all_files if '.RESOLVED' in f['name']]
     
     if verbose:
         print(f"📁 Files in Azure changefeed path:")
@@ -83,7 +94,7 @@ def check_azure_files(
         
         if data_files:
             print(f"\n   Example data file:")
-            print(f"   {data_files[0].name}")
+            print(f"   {data_files[0]['name']}")
     
     return {
         'data_files': data_files,
@@ -197,7 +208,7 @@ def wait_for_changefeed_files(
             
             if resolved_files:
                 # RESOLVED file found!
-                resolved_file = resolved_files[-1].name  # Get latest RESOLVED file
+                resolved_file = resolved_files[-1]['name']  # Get latest RESOLVED file
                 data_file_count = len(result['data_files'])
                 
                 print(f"\n✅ RESOLVED file found after {elapsed} seconds!")
@@ -281,7 +292,7 @@ def wait_for_changefeed_files(
                         # Stabilization period complete - all files have landed
                         print(f"\n✅ File count stable at {current_file_count} for {stabilization_wait}s")
                         print(f"   Total wait time: {elapsed + stable_elapsed}s")
-                        print(f"   Example: {result['data_files'][0].name}")
+                        print(f"   Example: {result['data_files'][0]['name']}")
                         
                         return {
                             'success': True,

@@ -9,7 +9,7 @@ import json
 import os
 from dataclasses import dataclass
 from urllib.parse import quote
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 
 @dataclass
@@ -43,6 +43,16 @@ class AzureStorageConfig:
 
 
 @dataclass
+class UCVolumeConfig:
+    """Unity Catalog external volume configuration."""
+    volume_catalog: str
+    volume_schema: str
+    volume_name: str
+    volume_full_path: str
+    volume_id: str
+
+
+@dataclass
 class CDCConfig:
     """CDC changefeed configuration."""
     mode: str
@@ -68,9 +78,11 @@ class Config:
     """Complete configuration for CockroachDB CDC to Databricks."""
     cockroachdb: CockroachDBConfig
     tables: TableConfig
-    azure_storage: AzureStorageConfig
     cdc_config: CDCConfig
     workload_config: WorkloadConfig
+    data_source: str = "azure_storage"  # "azure_storage" or "uc_external_volume"
+    azure_storage: Optional[AzureStorageConfig] = None
+    uc_volume: Optional[UCVolumeConfig] = None
 
 
 def load_config(config_file: str) -> Dict[str, Any]:
@@ -98,9 +110,10 @@ def process_config(config: Dict[str, Any]) -> Config:
     
     This function:
     - Extracts all configuration values into individual variables
-    - URL-encodes the Azure storage account key
+    - URL-encodes the Azure storage account key (if Azure storage is used)
     - Auto-suffixes table names with CDC mode and column family mode if enabled
-    - Generates the CDC path in Azure storage
+    - Generates the CDC path in storage (Azure or UC Volume)
+    - Supports both azure_storage and uc_external_volume data sources
     
     Args:
         config: Raw configuration dictionary
@@ -112,9 +125,6 @@ def process_config(config: Dict[str, Any]) -> Config:
     source_catalog = config["cockroachdb_source"]["catalog"]
     source_schema = config["cockroachdb_source"]["schema"]
     source_table = config["cockroachdb_source"]["table_name"]
-
-    storage_account_key = config["azure_storage"]["account_key"]
-    storage_account_key_encoded = quote(storage_account_key, safe='')
 
     target_table = config["databricks_target"]["table_name"]
 
@@ -138,8 +148,11 @@ def process_config(config: Dict[str, Any]) -> Config:
     # Extract format for reuse (default: parquet)
     cdc_format = config["cdc_config"].get("format", "parquet")
 
-    # Set the path in azure
+    # Set the path structure (same for both Azure and UC Volume)
     path = f"{cdc_format}/{source_catalog}/{source_schema}/{source_table}/{target_table}"
+
+    # Determine data source (default to azure_storage for backward compatibility)
+    data_source = config["cdc_config"].get("data_source", "azure_storage")
 
     # Create dataclass instances
     cockroachdb_config = CockroachDBConfig(
@@ -159,12 +172,29 @@ def process_config(config: Dict[str, Any]) -> Config:
         destination_table_name=target_table
     )
     
-    azure_storage_config = AzureStorageConfig(
-        account_name=config["azure_storage"]["account_name"],
-        account_key=storage_account_key,
-        account_key_encoded=storage_account_key_encoded,
-        container_name=config["azure_storage"]["container_name"]
-    )
+    # Process Azure storage config if present
+    azure_storage_config = None
+    if "azure_storage" in config and config["azure_storage"]:
+        storage_account_key = config["azure_storage"]["account_key"]
+        storage_account_key_encoded = quote(storage_account_key, safe='')
+        
+        azure_storage_config = AzureStorageConfig(
+            account_name=config["azure_storage"]["account_name"],
+            account_key=storage_account_key,
+            account_key_encoded=storage_account_key_encoded,
+            container_name=config["azure_storage"]["container_name"]
+        )
+    
+    # Process UC Volume config if present
+    uc_volume_config = None
+    if "uc_external_volume" in config and config["uc_external_volume"]:
+        uc_volume_config = UCVolumeConfig(
+            volume_catalog=config["uc_external_volume"]["volume_catalog"],
+            volume_schema=config["uc_external_volume"]["volume_schema"],
+            volume_name=config["uc_external_volume"]["volume_name"],
+            volume_full_path=config["uc_external_volume"]["volume_full_path"],
+            volume_id=config["uc_external_volume"]["volume_id"]
+        )
     
     cdc_config_obj = CDCConfig(
         mode=cdc_mode,
@@ -186,13 +216,21 @@ def process_config(config: Dict[str, Any]) -> Config:
     processed_config = Config(
         cockroachdb=cockroachdb_config,
         tables=table_config,
-        azure_storage=azure_storage_config,
         cdc_config=cdc_config_obj,
-        workload_config=workload_config
+        workload_config=workload_config,
+        data_source=data_source,
+        azure_storage=azure_storage_config,
+        uc_volume=uc_volume_config
     )
 
     # Print configuration summary
     print("✅ Configuration loaded")
+    print(f"   Data Source: {data_source}")
+    if data_source == "azure_storage" and azure_storage_config:
+        print(f"   Azure Storage Account: {azure_storage_config.account_name}")
+        print(f"   Container: {azure_storage_config.container_name}")
+    elif data_source == "uc_external_volume" and uc_volume_config:
+        print(f"   UC Volume: {uc_volume_config.volume_full_path}")
     print(f"   CDC Processing Mode: {cdc_mode}")
     print(f"   Column Family Mode: {column_family_mode}")
     print(f"   Primary Keys: {primary_key_columns}")
@@ -218,6 +256,65 @@ def load_and_process_config(config_file: str) -> Config:
     return process_config(config)
 
 
+def get_storage_path(config: Config) -> str:
+    """
+    Get the storage path based on the data source configuration.
+    
+    Args:
+        config: Processed Config dataclass instance
+    
+    Returns:
+        str: Full storage path for the CDC data
+        
+    Raises:
+        ValueError: If data source is not configured properly
+    
+    Example:
+        >>> config = load_and_process_config("config.json")
+        >>> path = get_storage_path(config)
+        >>> # Azure: abfss://container@account.dfs.core.windows.net/parquet/...
+        >>> # UC Volume: /Volumes/catalog/schema/volume/parquet/...
+    """
+    if config.data_source == "azure_storage":
+        if not config.azure_storage:
+            raise ValueError("Azure storage is selected but azure_storage config is missing")
+        return f"abfss://{config.azure_storage.container_name}@{config.azure_storage.account_name}.dfs.core.windows.net/{config.cdc_config.path}"
+    
+    elif config.data_source == "uc_external_volume":
+        if not config.uc_volume:
+            raise ValueError("UC external volume is selected but uc_external_volume config is missing")
+        return f"/Volumes/{config.uc_volume.volume_catalog}/{config.uc_volume.volume_schema}/{config.uc_volume.volume_name}/{config.cdc_config.path}"
+    
+    else:
+        raise ValueError(f"Unknown data source: {config.data_source}")
+
+
+def get_volume_path(config: Config) -> str:
+    """
+    Get the Unity Catalog volume path (for use with cockroachdb_uc_volume.py functions).
+    
+    Args:
+        config: Processed Config dataclass instance
+    
+    Returns:
+        str: UC Volume base path
+        
+    Raises:
+        ValueError: If UC volume is not configured
+    
+    Example:
+        >>> config = load_and_process_config("config.json")
+        >>> volume_path = get_volume_path(config)
+        >>> # Returns: /Volumes/catalog/schema/volume
+    """
+    if not config.uc_volume:
+        raise ValueError("UC external volume is not configured")
+    
+    return f"/Volumes/{config.uc_volume.volume_catalog}/{config.uc_volume.volume_schema}/{config.uc_volume.volume_name}"
+
+
 if __name__ == "__main__":
     # Example usage
     config = load_and_process_config("../.env/cockroachdb_cdc_tutorial_config_append_single_cf.json")
+    if config:
+        print(f"\nStorage path: {get_storage_path(config)}")

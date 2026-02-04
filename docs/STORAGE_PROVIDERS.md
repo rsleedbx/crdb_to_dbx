@@ -1,6 +1,38 @@
 # Storage Provider Support
 
+*Updated: February 4, 2026*
+
 The CockroachDB to Databricks CDC connector supports multiple cloud storage providers with a unified interface.
+
+---
+
+## Choosing Your Storage Provider
+
+### Quick Comparison
+
+| Feature | Azure Blob Storage | Unity Catalog Volume |
+|---------|-------------------|---------------------|
+| **Setup Complexity** | Simple | Moderate (requires UC setup) |
+| **Credential Management** | Manual (keys in config) | Automated (UC managed) |
+| **Governance** | None | Unity Catalog built-in |
+| **Auto Loader Performance** | Fast (~1-2s) | Fast (~2-3s with Spark) |
+| **Best For** | Quick start, testing | Production, compliance, multi-user |
+| **Production Ready** | ✅ Yes | ✅ Yes |
+
+### When to Choose Each
+
+**Choose Azure Blob Storage if:**
+- ✅ You want the simplest setup
+- ✅ Testing or prototyping
+- ✅ Single-user development
+- ✅ Don't need Unity Catalog governance
+
+**Choose Unity Catalog Volume if:**
+- ✅ Production deployment
+- ✅ Need governance and audit logging
+- ✅ Multiple users need access
+- ✅ Want centralized permission management
+- ✅ Compliance requirements
 
 ---
 
@@ -9,19 +41,154 @@ The CockroachDB to Databricks CDC connector supports multiple cloud storage prov
 ### 1. Azure Blob Storage (`cockroachdb_azure.py`)
 - ✅ Production ready
 - ✅ Uses Azure Storage SDK
+- ✅ Direct access with storage account keys
 - ✅ Works in all Databricks environments
+- ✅ Fastest setup (minimal configuration)
 
-### 2. Unity Catalog Volumes (`cockroachdb_uc_volume.py`)
+### 2. Unity Catalog External Volumes (`cockroachdb_uc_volume.py`)
 - ✅ Production ready
-- ✅ Uses `dbutils.fs` API
+- ✅ Uses Spark for fast parallel file operations
 - ✅ Works in Databricks workspace, Serverless, and notebooks
-- ✅ No cloud credentials needed (managed by Unity Catalog)
+- ✅ **Zero credentials needed for Auto Loader** (Unity Catalog managed)
+- ✅ Built-in governance and auditing
+- ✅ Centralized access control
 
 ### 3. Future Providers (Extensible Design)
 - 🔜 AWS S3 (`cockroachdb_s3.py`)
 - 🔜 Google Cloud Storage (`cockroachdb_gcs.py`)
 - 🔜 Cloudflare R2 (`cockroachdb_r2.py`)
-- 🔜 MinIO (`cockroachdb_minio.py`)
+
+---
+
+## Configuration
+
+### Azure Blob Storage Configuration
+
+**Step 1: Create Azure Resources**
+```bash
+# Run the setup script (creates storage account, container, credentials)
+./scripts/01_azure_storage.sh
+```
+
+**Step 2: Create Config File**
+
+`config.json`:
+```json
+{
+  "cdc_config": {
+    "data_source": "azure_storage",
+    "mode": "update_delete",
+    "column_family_mode": "multi_cf",
+    "format": "parquet"
+  },
+  "azure_storage": {
+    "account_name": "cockroachcdc1234567890",
+    "account_key": "your-azure-storage-key",
+    "container_name": "changefeed-events"
+  },
+  "cockroachdb_source": {
+    "catalog": "defaultdb",
+    "schema": "public",
+    "table_name": "usertable"
+  },
+  "databricks_target": {
+    "catalog": "main",
+    "schema": "default",
+    "table_name": "usertable_cdc"
+  }
+}
+```
+
+**Step 3: Use in Code**
+```python
+from cockroachdb_config import load_and_process_config
+from cockroachdb_storage import check_files
+from cockroachdb_autoload import ingest_cdc_with_merge_multi_family
+
+config = load_and_process_config("config.json")
+
+# Check files
+result = check_files(config, spark)
+
+# Run ingestion
+query = ingest_cdc_with_merge_multi_family(config, spark)
+```
+
+### Unity Catalog Volume Configuration
+
+**Step 1: Create Unity Catalog Volume**
+```bash
+# Run the setup script (creates volume + all Azure resources)
+./scripts/01_azure_storage.sh
+```
+
+The script creates:
+- Azure storage account and container
+- Managed identity and access connector
+- Unity Catalog storage credential
+- Unity Catalog external location
+- Unity Catalog external volume
+
+**Step 2: Create Config File**
+
+`config.json`:
+```json
+{
+  "cdc_config": {
+    "data_source": "uc_external_volume",
+    "mode": "update_delete",
+    "column_family_mode": "multi_cf",
+    "format": "parquet"
+  },
+  "uc_external_volume": {
+    "volume_catalog": "main",
+    "volume_schema": "default",
+    "volume_name": "cockroachdb_cdc_volume",
+    "volume_full_path": "main.default.cockroachdb_cdc_volume",
+    "volume_id": "your-volume-id"
+  },
+  "azure_storage": {
+    "account_name": "cockroachcdc1234567890",
+    "account_key": "your-azure-storage-key",
+    "container_name": "changefeed-events"
+  },
+  "cockroachdb_source": {
+    "catalog": "defaultdb",
+    "schema": "public",
+    "table_name": "usertable"
+  },
+  "databricks_target": {
+    "catalog": "main",
+    "schema": "default",
+    "table_name": "usertable_cdc"
+  }
+}
+```
+
+**Note:** `azure_storage` section is only needed for changefeed creation (tutorial/demo). For production Auto Loader (just reading), you can omit it. See [UC_VOLUME_CREDENTIALS.md](./UC_VOLUME_CREDENTIALS.md) for details.
+
+**Step 3: Grant Volume Access**
+```sql
+-- Grant access to users who need to read CDC data
+GRANT USE VOLUME ON main.default.cockroachdb_cdc_volume TO `user@company.com`;
+```
+
+**Step 4: Use in Code**
+```python
+from cockroachdb_config import load_and_process_config
+from cockroachdb_storage import check_files
+from cockroachdb_autoload import ingest_cdc_with_merge_multi_family
+
+config = load_and_process_config("config.json")
+
+# Check files (automatically uses UC Volume)
+result = check_files(config, spark)
+
+# Run ingestion (automatically uses UC Volume)
+query = ingest_cdc_with_merge_multi_family(config, spark)
+```
+
+**Key Difference:** Same code, different config! The `data_source` field determines which storage provider is used.
 
 ---
 
@@ -133,22 +300,20 @@ result = check_volume_files(
     source_schema="public",
     source_table="usertable",
     target_table="usertable_cdc",
-    spark=spark,      # Required for Volume operations
-    dbutils=dbutils   # Required for file system access
+    spark=spark  # Required for Volume operations
 )
 
 print(f"Data files: {len(result['data_files'])}")
 print(f"RESOLVED files: {len(result['resolved_files'])}")
 
 # Wait for RESOLVED file (recommended for production)
-result = wait_for_changefeed_files_volume(
+result = wait_for_changefeed_files(
     volume_path="/Volumes/main/default/cdc",
     source_catalog="defaultdb",
     source_schema="public",
     source_table="usertable",
     target_table="usertable_cdc",
     spark=spark,
-    dbutils=dbutils,
     max_wait=300,
     wait_for_resolved=True  # ✅ Guarantees completeness
 )
@@ -169,7 +334,7 @@ else:
 |-------|---------------------|----------------|-----------------|
 | `storage_account_name` | `volume_path` | `bucket_name` | `bucket_name` |
 | `storage_account_key` | `spark` | `access_key_id` | `credentials_json` |
-| `container_name` | `dbutils` | `secret_access_key` | - |
+| `container_name` | - | `secret_access_key` | - |
 
 ### Common Parameters (All Providers)
 
@@ -221,42 +386,43 @@ else:
 **Disadvantages:**
 - Requires Unity Catalog setup
 - Only works in Databricks environments
-- Requires `spark` and `dbutils` objects
+- Requires `spark` session
 
 ---
 
-## Migration Between Providers
+## Switching Between Providers
 
-Switching between providers requires minimal code changes:
+The unified storage functions make switching trivial - just update your config:
 
+**Azure Configuration:**
+```json
+{
+  "cdc_config": {
+    "data_source": "azure_storage"
+  },
+  "azure_storage": { ... }
+}
+```
+
+**UC Volume Configuration:**
+```json
+{
+  "cdc_config": {
+    "data_source": "uc_external_volume"
+  },
+  "uc_external_volume": { ... }
+}
+```
+
+**Same Code, Different Config:**
 ```python
-# Before: Azure
-from crdb_to_dbx import check_azure_files
+from cockroachdb_storage import check_files
 
-result = check_azure_files(
-    storage_account_name="myaccount",
-    storage_account_key="<key>",
-    container_name="cockroachcdc",
-    source_catalog="defaultdb",
-    source_schema="public",
-    source_table="usertable",
-    target_table="usertable_cdc"
-)
+# Works with BOTH Azure and UC Volume
+config = load_and_process_config("config.json")
+result = check_files(config, spark)
 
-# After: Unity Catalog Volume
-from crdb_to_dbx import check_volume_files
-
-result = check_volume_files(
-    volume_path="/Volumes/main/default/cdc",  # ← Changed
-    source_catalog="defaultdb",               # Same
-    source_schema="public",                   # Same
-    source_table="usertable",                 # Same
-    target_table="usertable_cdc",             # Same
-    spark=spark,                              # ← Added
-    dbutils=dbutils                           # ← Added
-)
-
-# Return structure is identical!
+# Automatically uses the right provider based on config.data_source
 print(f"Data files: {len(result['data_files'])}")
 print(f"RESOLVED files: {len(result['resolved_files'])}")
 ```
@@ -366,15 +532,16 @@ result = wait_for_changefeed_files_volume(
 
 ### 2. Choose Provider Based on Environment
 ```python
-# In Databricks workspace → Use Unity Catalog Volume
-if spark and dbutils:
-    from crdb_to_dbx import check_volume_files
-    result = check_volume_files(volume_path=..., spark=spark, dbutils=dbutils, ...)
+# Recommended: Use unified storage functions
+from cockroachdb_storage import check_files
 
-# Outside Databricks → Use Azure/S3/GCS
-else:
-    from crdb_to_dbx import check_azure_files
-    result = check_azure_files(storage_account_name=..., ...)
+# Load config (determines provider automatically)
+config = load_and_process_config("config.json")
+
+# Works with both Azure and UC Volume
+result = check_files(config, spark)
+
+# Provider selection is config-driven!
 ```
 
 ### 3. Handle Timeouts Gracefully

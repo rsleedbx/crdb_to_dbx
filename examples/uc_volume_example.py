@@ -13,13 +13,13 @@ Prerequisites:
        INTO 'external://volume_sink'  -- Configured to write to volume
        WITH format='parquet', updated, resolved='10s';
     
-    3. Databricks workspace environment with spark and dbutils
+    3. Databricks workspace environment with spark
 """
 
-from crdb_to_dbx import check_volume_files, wait_for_changefeed_files_volume
+from crdb_to_dbx.cockroachdb_uc_volume import check_volume_files, wait_for_changefeed_files
 
 
-def example_check_files(spark, dbutils):
+def example_check_files(spark):
     """
     Example: Check for existing changefeed files in Unity Catalog Volume.
     """
@@ -34,7 +34,6 @@ def example_check_files(spark, dbutils):
         source_table="usertable",
         target_table="usertable_cdc",
         spark=spark,
-        dbutils=dbutils,
         verbose=True
     )
     
@@ -55,7 +54,7 @@ def example_check_files(spark, dbutils):
         print(f"  Path: {result['resolved_files'][-1]['path']}")
 
 
-def example_wait_for_resolved(spark, dbutils):
+def example_wait_for_resolved(spark):
     """
     Example: Wait for RESOLVED file to appear (recommended for production).
     
@@ -65,14 +64,13 @@ def example_wait_for_resolved(spark, dbutils):
     print("Example 2: Wait for RESOLVED file (Production Pattern)")
     print("=" * 80)
     
-    result = wait_for_changefeed_files_volume(
+    result = wait_for_changefeed_files(
         volume_path="/Volumes/main/default/cdc_landing",
         source_catalog="defaultdb",
         source_schema="public",
         source_table="usertable",
         target_table="usertable_cdc",
         spark=spark,
-        dbutils=dbutils,
         max_wait=300,  # Wait up to 5 minutes
         check_interval=10,  # Check every 10 seconds
         wait_for_resolved=True  # ✅ Wait for RESOLVED (recommended!)
@@ -90,7 +88,7 @@ def example_wait_for_resolved(spark, dbutils):
         print(f"  Files found: {result['file_count']}")
 
 
-def example_wait_for_data_files_legacy(spark, dbutils):
+def example_wait_for_data_files_legacy(spark):
     """
     Example: Wait for data files with stabilization (legacy mode).
     
@@ -101,14 +99,13 @@ def example_wait_for_data_files_legacy(spark, dbutils):
     print("Example 3: Wait for data files (Legacy Mode)")
     print("=" * 80)
     
-    result = wait_for_changefeed_files_volume(
+    result = wait_for_changefeed_files(
         volume_path="/Volumes/main/default/cdc_landing",
         source_catalog="defaultdb",
         source_schema="public",
         source_table="usertable",
         target_table="usertable_cdc",
         spark=spark,
-        dbutils=dbutils,
         max_wait=120,
         stabilization_wait=10,  # Wait 10s for file count to stabilize
         wait_for_resolved=False  # Legacy mode
@@ -122,7 +119,7 @@ def example_wait_for_data_files_legacy(spark, dbutils):
         print(f"\n❌ Timeout after {result['elapsed_time']}s")
 
 
-def example_multi_table_coordination(spark, dbutils):
+def example_multi_table_coordination(spark):
     """
     Example: Multi-table CDC with RESOLVED watermark coordination.
     
@@ -144,14 +141,13 @@ def example_multi_table_coordination(spark, dbutils):
     print("\nStep 1: Waiting for RESOLVED files from all tables...")
     for source_table, target_table in tables:
         print(f"\n  Checking {source_table}...")
-        result = wait_for_changefeed_files_volume(
+        result = wait_for_changefeed_files(
             volume_path="/Volumes/main/default/cdc_landing",
             source_catalog="defaultdb",
             source_schema="public",
             source_table=source_table,
             target_table=target_table,
             spark=spark,
-            dbutils=dbutils,
             max_wait=300,
             wait_for_resolved=True
         )
@@ -198,34 +194,31 @@ if __name__ == "__main__":
     print("Unity Catalog Volume Examples")
     print("=" * 80)
     print()
-    print("Note: This script requires spark and dbutils to be available.")
+    print("Note: This script requires spark to be available.")
     print("Run in Databricks workspace notebook or with Databricks Connect.")
     print()
     
-    # Check if spark and dbutils are available
+    # Check if spark is available
     try:
-        # In Databricks notebooks, these are automatically available
+        # In Databricks notebooks, spark is automatically available
         spark  # noqa: F821
-        dbutils  # noqa: F821
         
         # Run examples
-        example_check_files(spark, dbutils)
-        example_wait_for_resolved(spark, dbutils)
-        # example_wait_for_data_files_legacy(spark, dbutils)  # Optional
-        # example_multi_table_coordination(spark, dbutils)  # Optional
+        example_check_files(spark)
+        example_wait_for_resolved(spark)
+        # example_wait_for_data_files_legacy(spark)  # Optional
+        # example_multi_table_coordination(spark)  # Optional
         
     except NameError:
-        print("❌ Error: spark and dbutils not available")
+        print("❌ Error: spark not available")
         print()
         print("To run this example:")
         print("  1. Copy to Databricks notebook, OR")
         print("  2. Use Databricks Connect:")
         print()
         print("     from databricks.connect import DatabricksSession")
-        print("     from pyspark.dbutils import DBUtils")
         print()
         print("     spark = DatabricksSession.builder.getOrCreate()")
-        print("     dbutils = DBUtils(spark)")
         print()
         print("     # Then run examples")
-        print("     example_check_files(spark, dbutils)")
+        print("     example_check_files(spark)")

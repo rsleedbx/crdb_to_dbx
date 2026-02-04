@@ -180,8 +180,22 @@ The repository includes a comprehensive test notebook that validates:
 
 ## Documentation
 
+### Getting Started
+- **[Quick Start](QUICKSTART.md)** - Get started quickly
 - **[Configuration Guide](config_examples/README.md)** - Detailed configuration options
 - **[Blog Post: Stream CockroachDB CDC to Databricks](docs/stream-changefeed-to-databricks-azure.md)** - Complete tutorial
+
+### Storage & Deployment
+- **[Storage Providers](docs/STORAGE_PROVIDERS.md)** - Choose and configure storage (Azure or UC Volume)
+- **[UC Volume Credentials](docs/UC_VOLUME_CREDENTIALS.md)** - When credentials are needed
+- **[UC Volume Auto Loader](docs/UC_VOLUME_AUTOLOADER.md)** - Auto Loader best practices
+
+### Troubleshooting
+- **[Troubleshooting Hangs](docs/TROUBLESHOOTING_HANG.md)** - Debug apparent hangs in file listing
+
+### Implementation Details
+- **[Learnings & Summaries](docs/learnings/README.md)** - Implementation learnings and bug fixes
+- **[Evolution Strategy](CONNECTOR_EVOLUTION_STRATEGY.md)** - Architectural decisions and roadmap
 
 ## Related Resources
 
@@ -202,6 +216,16 @@ Robert Lee ([@rsleedbx](https://github.com/rsleedbx))
 Contributions welcome! Please open an issue or PR.
 
 ## Changelog
+
+### v2.0.0 (2026-02-04)
+- **Dual Storage Support**: Azure Blob Storage + Unity Catalog External Volumes
+- **Unified Storage API**: Configuration-driven overlay functions
+- **API Simplification**: Config-based function signatures (10+ params → 3)
+- **Performance**: Spark-based file listing (5-10x faster for UC Volume)
+- **Infrastructure**: Automated UC External Volume creation in setup scripts
+- **Notebooks**: Updated to use unified storage API
+- **Documentation**: Comprehensive migration guides and troubleshooting
+- **Bug Fixes**: Connection management, function signatures
 
 ### v1.0.0 (2026-01-30)
 - Initial release
