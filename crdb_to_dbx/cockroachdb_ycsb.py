@@ -224,14 +224,16 @@ def deduplicate_to_latest(
     from pyspark.sql import functions as F
     from pyspark.sql.window import Window
     
-    # Auto-detect timestamp column if not provided
+    # Auto-detect timestamp column if not provided (prefer full nanosecond precision)
     if timestamp_col is None:
-        if '_cdc_timestamp' in df.columns:
+        if '_cdc_timestamp_nanos' in df.columns:
+            timestamp_col = '_cdc_timestamp_nanos'
+        elif '_cdc_timestamp' in df.columns:
             timestamp_col = '_cdc_timestamp'
         elif '__crdb__updated' in df.columns:
             timestamp_col = '__crdb__updated'
         else:
-            raise ValueError("No timestamp column found. Provide timestamp_col explicitly or ensure DataFrame has _cdc_timestamp or __crdb__updated")
+            raise ValueError("No timestamp column found. Provide timestamp_col explicitly or ensure DataFrame has _cdc_timestamp_nanos, _cdc_timestamp, or __crdb__updated")
     
     if verbose:
         original_count = df.count()

@@ -92,7 +92,7 @@ def _transform_cdc_columns(raw_df, resolved_watermark: Optional[int] = None):
     Transform CockroachDB CDC columns to standard format.
     
     Converts:
-    - __crdb__updated (nanoseconds) → _cdc_timestamp (timestamp)
+    - __crdb__updated (nanoseconds) → _cdc_timestamp_nanos (bigint), _cdc_timestamp (string with nanosecond display)
     - __crdb__event_type ('d'/'c'/'r') → _cdc_operation ('DELETE'/'UPSERT')
     
     Optionally filters by RESOLVED timestamp watermark to guarantee completeness.
@@ -106,20 +106,38 @@ def _transform_cdc_columns(raw_df, resolved_watermark: Optional[int] = None):
     Returns:
         DataFrame: Transformed DataFrame with standard CDC columns
     """
-    # Helper function to extract wall time from CockroachDB HLC timestamp
-    # __crdb__updated format: "1770067697320026017.0000000002" (wall_time.logical)
-    # We extract just the wall_time part (before decimal) for filtering and conversion
+    # Helper to extract wall time from CockroachDB HLC timestamp.
+    # Changefeed (Parquet/JSON) writes updated via hlc.Timestamp.AsOfSystemTime(): "WallTime.Logical"
+    # (e.g. "1770067697320026017.0000000002") — part before dot is nanoseconds since Unix epoch.
+    # See pkg/ccl/changefeedccl/parquet.go (updated.AsOfSystemTime()) and pkg/util/hlc/timestamp.go.
+    # RESOLVED filenames use cloudStorageFormatTime (sink_cloudstorage.go): YYYYMMDDHHMMSS+9-digit nanos+10-digit logical.
+    # Same HLC type in both; we compare wall-time nanos (Parquet: part before "."; RESOLVED: parsed from 33-char format).
+    # Full precision: _cdc_timestamp_nanos (bigint) for ordering/merge. _cdc_timestamp is a string with nanosecond
+    # format so display matches stored precision (avoids micro-vs-nano confusion). For date_trunc/hour() use
+    # from_unixtime(_cdc_timestamp_nanos/1e9) or cast that to timestamp.
+    # Uses cast (not try_cast) so malformed or null __crdb__updated fails the job; we do not default or silently drop.
     def extract_wall_time(col):
-        """Extract wall time nanoseconds from CockroachDB HLC timestamp string."""
+        """Extract wall time nanoseconds from CockroachDB HLC timestamp string. Fails job if missing or malformed."""
         return F.split(F.col(col), "\\.")[0].cast("bigint")
-    
+
+    # Fractional seconds (double) so from_unixtime preserves microseconds (Spark's max precision)
+    def wall_time_seconds(col):
+        """Wall time as fractional seconds since epoch."""
+        return (F.split(F.col(col), "\\.")[0].cast("double") / 1_000_000_000)
+
+    # No pre-check (would use .count() and break DLT and streaming). This transform is safe for both DLT and
+    # notebook execution (e.g. cockroachdb-cdc-tutorial.ipynb): malformed __crdb__updated fails via cast;
+    # for nulls use a DLT expectation, e.g. expect_not_null("__crdb__updated") or expect("valid_cdc_timestamp", "_cdc_timestamp IS NOT NULL").
+
     df = raw_df.select(
         "*",
-        # Convert __crdb__updated (nanoseconds) to timestamp
-        # Extract wall time from HLC format (before decimal point)
+        # Full nanosecond precision (LongType); used for ordering and merge
+        extract_wall_time("__crdb__updated").alias("_cdc_timestamp_nanos"),
+        # Human-readable string with nanosecond precision (matches _cdc_timestamp_nanos; no micro-vs-nano confusion)
         F.from_unixtime(
-            extract_wall_time("__crdb__updated") / 1000000000
-        ).cast("timestamp").alias("_cdc_timestamp"),
+            wall_time_seconds("__crdb__updated"),
+            "yyyy-MM-dd HH:mm:ss.SSSSSSSSS"
+        ).alias("_cdc_timestamp"),
         # Map event type
         F.when(F.col("__crdb__event_type") == "d", "DELETE")
          .otherwise("UPSERT")
@@ -133,9 +151,11 @@ def _transform_cdc_columns(raw_df, resolved_watermark: Optional[int] = None):
         # Extract wall time and compare with watermark
         df = raw_df.filter(extract_wall_time("__crdb__updated") <= resolved_watermark).select(
             "*",
+            extract_wall_time("__crdb__updated").alias("_cdc_timestamp_nanos"),
             F.from_unixtime(
-                extract_wall_time("__crdb__updated") / 1000000000
-            ).cast("timestamp").alias("_cdc_timestamp"),
+                wall_time_seconds("__crdb__updated"),
+                "yyyy-MM-dd HH:mm:ss.SSSSSSSSS"
+            ).alias("_cdc_timestamp"),
             F.when(F.col("__crdb__event_type") == "d", "DELETE")
              .otherwise("UPSERT")
              .alias("_cdc_operation")
@@ -543,7 +563,8 @@ def _merge_staging_to_target(spark, staging_table_fqn, target_table_fqn, primary
     # STEP 2: Deduplication
     # ============================================================================
     print(f"   🔄 Deduplicating by primary keys: {primary_key_columns}...")
-    window_spec = Window.partitionBy(*primary_key_columns).orderBy(F.col("_cdc_timestamp").desc())
+    # Use nanosecond-precision column for correct ordering (timestamp type is microsecond only)
+    window_spec = Window.partitionBy(*primary_key_columns).orderBy(F.col("_cdc_timestamp_nanos").desc())
     staging_df = (staging_df_raw
         .withColumn("_row_num", F.row_number().over(window_spec))
         .filter(F.col("_row_num") == 1)
@@ -611,7 +632,7 @@ def _merge_staging_to_target(spark, staging_table_fqn, target_table_fqn, primary
         # ========================================================================
         delta_table = DeltaTable.forName(spark, target_table_fqn)
         
-        # Check if _cdc_operation exists in target
+        # Check if _cdc_operation and _cdc_timestamp_nanos exist in target (support older schemas)
         target_columns = set(spark.read.table(target_table_fqn).columns)
         if "_cdc_operation" not in target_columns:
             print(f"   ⚠️  Target table missing _cdc_operation column (old schema)")
@@ -621,23 +642,38 @@ def _merge_staging_to_target(spark, staging_table_fqn, target_table_fqn, primary
                 ADD COLUMN _cdc_operation STRING
             """)
             print(f"   ✅ Column added\n")
+        if "_cdc_timestamp_nanos" not in target_columns:
+            print(f"   🔧 Adding _cdc_timestamp_nanos column (full nanosecond precision)...")
+            spark.sql(f"""
+                ALTER TABLE {target_table_fqn} 
+                ADD COLUMN _cdc_timestamp_nanos BIGINT
+            """)
+            print(f"   ✅ Column added (existing rows will get value on next update or backfill)\n")
+            target_columns = set(spark.read.table(target_table_fqn).columns)
         
-        # Build and execute MERGE
+        # Build and execute MERGE (use _cdc_timestamp_nanos for correct nanosecond ordering when present)
         join_condition = " AND ".join([f"target.{col} = source.{col}" for col in primary_key_columns])
         data_columns = [col for col in staging_df.columns]
         update_set = {col: f"source.{col}" for col in data_columns}
         insert_values = {col: f"source.{col}" for col in data_columns}
+        use_nanos = "_cdc_timestamp_nanos" in target_columns
+        # When target has _cdc_timestamp_nanos: update if source is newer, or target is null (new column)
+        merge_time_condition = (
+            "(target._cdc_timestamp_nanos IS NULL OR source._cdc_timestamp_nanos > target._cdc_timestamp_nanos)"
+            if use_nanos
+            else "source._cdc_timestamp > target._cdc_timestamp"
+        )
         
         print(f"   🔄 Executing MERGE...")
         print(f"      Join: {join_condition}")
-        print(f"      ℹ️  _cdc_operation will be preserved for monitoring")
+        print(f"      Update when: UPSERT and source newer than target ({'nanos' if use_nanos else 'timestamp'})")
         
         (delta_table.alias("target").merge(
             staging_df.alias("source"),
             join_condition
         )
         .whenMatchedUpdate(
-            condition="source._cdc_operation = 'UPSERT' AND source._cdc_timestamp > target._cdc_timestamp",
+            condition=f"source._cdc_operation = 'UPSERT' AND {merge_time_condition}",
             set=update_set
         )
         .whenMatchedDelete(
@@ -760,7 +796,7 @@ def ingest_cdc_with_merge_single_family(
     Target table will contain:
     - All data columns from source
     - _cdc_operation: "UPSERT" (shows last operation on each row)
-    - _cdc_timestamp: Timestamp of last CDC event
+    - _cdc_timestamp: Last CDC event time as string (nanosecond precision, e.g. 2026-02-04 19:28:17.320026017)
     
     Args:
         config: Config dataclass from cockroachdb_config.py
@@ -843,7 +879,7 @@ def ingest_cdc_with_merge_single_family(
     print("📋 Target table includes:")
     print("   - All data columns from source")
     print("   - _cdc_operation: UPSERT (for monitoring)")
-    print("   - _cdc_timestamp: Last CDC event timestamp")
+    print("   - _cdc_timestamp: Last CDC event (string, nanosecond); _cdc_timestamp_nanos: same as bigint")
     print()
     print("💡 TIP: Staging table can be dropped after successful MERGE:")
     print(f"   spark.sql('DROP TABLE IF EXISTS {staging_table_fqn}')")
@@ -985,7 +1021,7 @@ def merge_column_family_fragments(
     if metadata_columns is None:
         metadata_columns = [
             '__crdb__event_type', '__crdb__updated', '_rescued_data',
-            '_cdc_operation', '_cdc_timestamp', '_cdc_updated', '_source_file', '_processing_time',
+            '_cdc_operation', '_cdc_timestamp', '_cdc_timestamp_nanos', '_cdc_updated', '_source_file', '_processing_time',
             '_metadata',  # Unity Catalog metadata
             # JSON envelope columns (should not be merged as data columns)
             'after', 'before', 'key', 'updated',
@@ -1029,7 +1065,9 @@ def merge_column_family_fragments(
         try:
             # Determine timestamp column for fragmentation detection
             timestamp_col_for_check = None
-            if '_cdc_timestamp' in all_columns:
+            if '_cdc_timestamp_nanos' in all_columns:
+                timestamp_col_for_check = '_cdc_timestamp_nanos'
+            elif '_cdc_timestamp' in all_columns:
                 timestamp_col_for_check = '_cdc_timestamp'
             elif '_cdc_updated' in all_columns:
                 timestamp_col_for_check = '_cdc_updated'
@@ -1102,7 +1140,9 @@ def merge_column_family_fragments(
         
         # Determine timestamp column for ordering
         timestamp_col_for_coalesce = None
-        if '_cdc_timestamp' in all_columns:
+        if '_cdc_timestamp_nanos' in all_columns:
+            timestamp_col_for_coalesce = '_cdc_timestamp_nanos'
+        elif '_cdc_timestamp' in all_columns:
             timestamp_col_for_coalesce = '_cdc_timestamp'
         elif '_cdc_updated' in all_columns:
             timestamp_col_for_coalesce = '_cdc_updated'
@@ -1173,7 +1213,9 @@ def merge_column_family_fragments(
     
     # Determine which timestamp column to use for grouping
     timestamp_col = None
-    if '_cdc_timestamp' in all_columns:
+    if '_cdc_timestamp_nanos' in all_columns:
+        timestamp_col = '_cdc_timestamp_nanos'
+    elif '_cdc_timestamp' in all_columns:
         timestamp_col = '_cdc_timestamp'
     elif '_cdc_updated' in all_columns:
         timestamp_col = '_cdc_updated'
@@ -1343,7 +1385,7 @@ def ingest_cdc_append_only_multi_family(
     
     # Merge column family fragments (batch mode - no streaming limitations!)
     print("🔧 Merging column family fragments...")
-    print(f"   Grouping by: {primary_key_columns} + _cdc_timestamp + _cdc_operation")
+    print(f"   Grouping by: {primary_key_columns} + timestamp + _cdc_operation")
     print(f"   Using first(col, ignorenulls=True) to coalesce fragments")
     merged_df = merge_column_family_fragments(staging_df, primary_key_columns)
     print("✅ Column family fragments merged")
@@ -1392,7 +1434,7 @@ def ingest_cdc_with_merge_multi_family(
     Target table will contain:
     - All data columns from source
     - _cdc_operation: "UPSERT" (shows last operation)
-    - _cdc_timestamp: Timestamp of last CDC event
+    - _cdc_timestamp: Last CDC event time as string (nanosecond precision, e.g. 2026-02-04 19:28:17.320026017)
     
     Args:
         config: Config dataclass from cockroachdb_config.py

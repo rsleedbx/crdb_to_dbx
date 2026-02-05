@@ -77,6 +77,7 @@ The repository includes comprehensive tutorial notebooks:
 - ✅ RESOLVED watermark coordination
 - ✅ Multi-table transaction consistency
 - ✅ Both storage providers (Azure, UC Volume)
+- ✅ Nanosecond-precision timestamps: `_cdc_timestamp_nanos` (bigint) for ordering/merge, `_cdc_timestamp` (string) for display
 
 ## Documentation
 

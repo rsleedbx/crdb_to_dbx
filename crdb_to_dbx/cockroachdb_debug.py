@@ -375,10 +375,11 @@ def compare_row_by_row(
         target_filter = " AND ".join(f"{k} == {v}" for k, v in key_values.items())
         target_filtered = target_df.filter(target_filter)
         
-        # For append_only mode, get the LATEST row by timestamp
+        # For append_only mode, get the LATEST row by timestamp (prefer nanosecond column)
         if cdc_mode == "append_only":
-            # Check if _cdc_timestamp column exists
-            if "_cdc_timestamp" in target_df.columns:
+            if "_cdc_timestamp_nanos" in target_df.columns:
+                target_filtered = target_filtered.orderBy(F.col("_cdc_timestamp_nanos").desc())
+            elif "_cdc_timestamp" in target_df.columns:
                 target_filtered = target_filtered.orderBy(F.col("_cdc_timestamp").desc())
             elif "__crdb__updated" in target_df.columns:
                 target_filtered = target_filtered.orderBy(F.col("__crdb__updated").desc())

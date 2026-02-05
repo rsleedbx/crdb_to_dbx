@@ -118,6 +118,8 @@ raw_df = (spark.readStream
 
 # Transform CockroachDB CDC format to Delta Lake
 # Note: __crdb__updated is HLC format '1234567890123456789.0000000001' (wall_time.logical)
+# The connector (cockroachdb_autoload) produces _cdc_timestamp_nanos (bigint) + _cdc_timestamp (string, nanosecond display).
+# Manual pipeline example below uses second precision; for nanos use extract wall time and from_unixtime with .SSSSSSSSS.
 df = raw_df.select(
     "*",
     F.from_unixtime(F.split(F.col("__crdb__updated"), "\\.")[0].cast("bigint") / 1000000000).cast("timestamp").alias("_cdc_timestamp"),
@@ -203,7 +205,7 @@ raw_df.writeStream.toTable(f"{target_table}_staging")
 # Stage 2: Apply MERGE from staging to final table
 staging_df = spark.read.table(f"{target_table}_staging")
 
-# Deduplicate to latest per key
+# Deduplicate to latest per key (use _cdc_timestamp_nanos when available for nanosecond ordering)
 window_spec = Window.partitionBy("ycsb_key").orderBy(F.col("_cdc_timestamp").desc())
 deduped_df = staging_df.withColumn("_row_num", F.row_number().over(window_spec)) \
     .filter(F.col("_row_num") == 1).drop("_row_num")
