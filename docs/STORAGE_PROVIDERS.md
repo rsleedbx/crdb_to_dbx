@@ -16,8 +16,7 @@ The CockroachDB to Databricks CDC connector supports multiple cloud storage prov
 | **Credential Management** | Manual (keys in config) | Automated (UC managed) |
 | **Governance** | None | Unity Catalog built-in |
 | **Auto Loader Performance** | Fast (~1-2s) | Fast (~2-3s with Spark) |
-| **Best For** | Quick start, testing | Production, compliance, multi-user |
-| **Production Ready** | ✅ Yes | ✅ Yes |
+| **Best For** | Quick start, testing | Governance, compliance, multi-user |
 
 ### When to Choose Each
 
@@ -28,25 +27,23 @@ The CockroachDB to Databricks CDC connector supports multiple cloud storage prov
 - ✅ Don't need Unity Catalog governance
 
 **Choose Unity Catalog Volume if:**
-- ✅ Production deployment
 - ✅ Need governance and audit logging
 - ✅ Multiple users need access
 - ✅ Want centralized permission management
 - ✅ Compliance requirements
+- ✅ Planning to scale beyond proof of concept
 
 ---
 
 ## Supported Providers
 
 ### 1. Azure Blob Storage (`cockroachdb_azure.py`)
-- ✅ Production ready
 - ✅ Uses Azure Storage SDK
 - ✅ Direct access with storage account keys
 - ✅ Works in all Databricks environments
 - ✅ Fastest setup (minimal configuration)
 
 ### 2. Unity Catalog External Volumes (`cockroachdb_uc_volume.py`)
-- ✅ Production ready
 - ✅ Uses Spark for fast parallel file operations
 - ✅ Works in Databricks workspace, Serverless, and notebooks
 - ✅ **Zero credentials needed for Auto Loader** (Unity Catalog managed)
@@ -101,9 +98,9 @@ The CockroachDB to Databricks CDC connector supports multiple cloud storage prov
 
 **Step 3: Use in Code**
 ```python
-from cockroachdb_config import load_and_process_config
-from cockroachdb_storage import check_files
-from cockroachdb_autoload import ingest_cdc_with_merge_multi_family
+from crdb_to_dbx.cockroachdb_config import load_and_process_config
+from crdb_to_dbx.cockroachdb_storage import check_files
+from crdb_to_dbx import ingest_cdc_with_merge_multi_family
 
 config = load_and_process_config("config.json")
 
@@ -175,9 +172,9 @@ GRANT USE VOLUME ON main.default.cockroachdb_cdc_volume TO `user@company.com`;
 
 **Step 4: Use in Code**
 ```python
-from cockroachdb_config import load_and_process_config
-from cockroachdb_storage import check_files
-from cockroachdb_autoload import ingest_cdc_with_merge_multi_family
+from crdb_to_dbx.cockroachdb_config import load_and_process_config
+from crdb_to_dbx.cockroachdb_storage import check_files
+from crdb_to_dbx import ingest_cdc_with_merge_multi_family
 
 config = load_and_process_config("config.json")
 
@@ -416,7 +413,8 @@ The unified storage functions make switching trivial - just update your config:
 
 **Same Code, Different Config:**
 ```python
-from cockroachdb_storage import check_files
+from crdb_to_dbx.cockroachdb_storage import check_files
+from crdb_to_dbx.cockroachdb_config import load_and_process_config
 
 # Works with BOTH Azure and UC Volume
 config = load_and_process_config("config.json")
@@ -533,7 +531,8 @@ result = wait_for_changefeed_files_volume(
 ### 2. Choose Provider Based on Environment
 ```python
 # Recommended: Use unified storage functions
-from cockroachdb_storage import check_files
+from crdb_to_dbx.cockroachdb_storage import check_files
+from crdb_to_dbx.cockroachdb_config import load_and_process_config
 
 # Load config (determines provider automatically)
 config = load_and_process_config("config.json")

@@ -206,7 +206,7 @@ ingest_cdc_...(config, spark)
 **Fix**:
 ```python
 # Verify path
-from cockroachdb_config import get_storage_path
+from crdb_to_dbx.cockroachdb_config import get_storage_path
 print(f"Volume path: {get_storage_path(config)}")
 
 # Clear checkpoint (in Databricks notebook)

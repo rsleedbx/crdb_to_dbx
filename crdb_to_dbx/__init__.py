@@ -19,8 +19,8 @@ from .cockroachdb_uc_volume import (
 
 # Auto Loader ingestion functions
 from .cockroachdb_autoload import (
-    ingest_cdc_append_only,
-    ingest_cdc_with_merge,
+    ingest_cdc_append_only_single_family,
+    ingest_cdc_with_merge_single_family,
     ingest_cdc_append_only_multi_family,
     ingest_cdc_with_merge_multi_family,
     merge_column_family_fragments
@@ -36,8 +36,8 @@ __all__ = [
     'wait_for_changefeed_files_volume',
     
     # Ingestion functions
-    'ingest_cdc_append_only',
-    'ingest_cdc_with_merge',
+    'ingest_cdc_append_only_single_family',
+    'ingest_cdc_with_merge_single_family',
     'ingest_cdc_append_only_multi_family',
     'ingest_cdc_with_merge_multi_family',
     'merge_column_family_fragments',

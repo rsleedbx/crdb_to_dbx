@@ -72,15 +72,38 @@ VALUES
 
 The CockroachDB changefeed automatically captures these changes and writes them to Azure Blob Storage.
 
-### Step 4. Configure Azure access *(Databricks)*
+### Step 4. Configure Unity Catalog access to Azure *(Databricks)*
 
-Configure Unity Catalog to access your Azure storage account using external locations with storage credentials. This approach works with all compute types including Databricks Serverless.
+Create an External Volume for governed, credential-free access to your Azure storage:
 
-See [Connect to cloud object storage using Unity Catalog](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/) for setup instructions.
+```sql
+-- 1. Create storage credential (one-time setup)
+CREATE STORAGE CREDENTIAL azure_cdc_credential
+WITH (AZURE_SERVICE_PRINCIPAL
+  '<client-id>',
+  '<directory-id>',
+  '<client-secret>'
+);
 
-**Alternative: Unity Catalog External Volumes**
+-- 2. Create external location pointing to your container
+CREATE EXTERNAL LOCATION azure_cdc_location
+URL 'abfss://changefeed-events@{storage_account}.dfs.core.windows.net/'
+WITH (STORAGE CREDENTIAL azure_cdc_credential);
 
-You can also access the same Azure storage through Unity Catalog External Volumes, which provides governed access without managing credentials in code. The connector supports both modes via configuration. See [STORAGE_PROVIDERS.md](./STORAGE_PROVIDERS.md) for configuration details.
+-- 3. Create external volume
+CREATE EXTERNAL VOLUME cdc_volume
+LOCATION azure_cdc_location;
+```
+
+Now you can access CDC files using: `/Volumes/catalog/schema/cdc_volume/parquet/...`
+
+**Benefits:**
+- ✅ Zero credentials in Auto Loader code
+- ✅ Centralized access control with `GRANT` statements
+- ✅ Built-in audit logging
+- ✅ Works with all compute types (including Serverless)
+
+See [Connect to cloud object storage using Unity Catalog](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/) for detailed setup instructions.
 
 ### Step 5. Stream into Databricks Delta Lake *(Databricks)*
 
@@ -278,7 +301,7 @@ WITH
 ```python
 from crdb_to_dbx import merge_column_family_fragments
 
-# Use production-ready merge implementation
+# Merge column family fragments
 df_merged = merge_column_family_fragments(
     df=raw_df,
     primary_key_columns=["ycsb_key"]
@@ -286,6 +309,15 @@ df_merged = merge_column_family_fragments(
 
 # Write to target
 df_merged.writeStream.toTable(target_table)
+```
+
+**Note:** For complete CDC pipelines, use the higher-level ingestion functions:
+```python
+from crdb_to_dbx.cockroachdb_config import load_and_process_config
+from crdb_to_dbx import ingest_cdc_with_merge_multi_family
+
+config = load_and_process_config("config.json")
+query = ingest_cdc_with_merge_multi_family(config=config, spark=spark)
 ```
 
 The `merge_column_family_fragments` function groups by primary key and timestamp, then coalesces NULL values across fragments using PySpark aggregations.
@@ -333,7 +365,7 @@ For multi-table coordination, column family details, and advanced usage, see the
 
 ## Next Steps
 
-**Complete working notebook**: All CDC modes with production-ready code are available in `sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`.
+**Complete working notebook**: All CDC modes and examples are available in `sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`.
 
 **Learn more:**
 - [CockroachDB Changefeed Documentation](https://www.cockroachlabs.com/docs/stable/create-changefeed)

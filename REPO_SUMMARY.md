@@ -6,7 +6,7 @@
 
 ## Overview
 
-A clean, production-ready Python repository for streaming CockroachDB CDC (Change Data Capture) to Databricks Delta Lake.
+A proof-of-concept Python repository for streaming CockroachDB CDC (Change Data Capture) to Databricks Delta Lake.
 
 ## What Was Created
 
@@ -22,7 +22,7 @@ A clean, production-ready Python repository for streaming CockroachDB CDC (Chang
 - Supports multiple modes: VOLUME, AZURE_PARQUET, AZURE_JSON, AZURE_DUAL, DIRECT
 - Auto-detects primary keys and column families
 - Handles fragment merging for split column families
-- ~5000+ lines of production-ready code
+- ~5000+ lines of CDC processing code
 
 ### Notebooks (`notebooks/`)
 
@@ -150,11 +150,11 @@ crdb_to_dbx/
 
 ## Key Features
 
-### ✅ Production Ready
+### ✅ Comprehensive Implementation
 - Complete error handling
 - Comprehensive logging
 - Type hints throughout
-- Well-tested code
+- Well-structured code
 
 ### ✅ Multi-Mode Support
 - **VOLUME**: Unity Catalog Volumes (file-based testing)
@@ -302,7 +302,7 @@ git push -u origin main
 
 ✅ **Self-Contained**: All dependencies in one repo  
 ✅ **Well-Documented**: 4 comprehensive guides  
-✅ **Production-Ready**: Used in real CDC pipelines  
+✅ **Proof of Concept**: Demonstrates CDC pipeline capabilities  
 ✅ **Easy Setup**: 5-minute quick start  
 ✅ **Maintainable**: Clean code structure  
 ✅ **Extensible**: Clear architecture for additions  

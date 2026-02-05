@@ -83,7 +83,7 @@
 | Parquet format support | Full CDC operations | ✅ **ACHIEVED** |
 | Community Connector (Iterator) | Working with volumes | ✅ **ACHIEVED** |
 | Standalone Autoloader | Complete mode to Delta | ✅ **ACHIEVED** |
-| DLT + Autoloader | Production-ready streaming | 🟡 **75% (building blocks ready)** |
+| DLT + Autoloader | Streaming pipeline | 🟡 **75% (building blocks ready)** |
 | Test coverage | All format/table/split scenarios | ✅ **8/8 passing** |
 | Code reuse | >50% shared logic | ✅ **55% achieved** |
 | Performance | <30 sec validation | ✅ **60× faster** |
@@ -96,9 +96,9 @@ We have successfully completed **Step 5: Community Connector** (100% complete)! 
 
 ## 📊 Executive Summary (Updated Jan 30, 2026)
 
-### Current Status: ✅ STEP 5 COMPLETE - PRODUCTION-READY WITH COMPREHENSIVE DIAGNOSTICS!
+### Current Status: ✅ STEP 5 COMPLETE - PROOF OF CONCEPT WITH COMPREHENSIVE DIAGNOSTICS!
 
-**Mission:** Build production-ready CDC connector with 5-step implementation roadmap
+**Mission:** Build proof-of-concept CDC connector with 5-step implementation roadmap
 
 **Latest Milestone (Jan 30, 2026):** Complete End-to-End Tutorial + Smart Diagnostics
 - ✅ Interactive tutorial notebook with 4 CDC modes
@@ -895,7 +895,7 @@ def users_cdc():
 ## 🆕 Recent Fixes & Enhancements (Feb 2, 2026)
 
 ### RESOLVED Timestamp Watermarking ✅ (Feb 2, 2026)
-**Achievement:** Production-ready column family completeness guarantee and multi-table consistency
+**Achievement:** Column family completeness guarantee and multi-table consistency
 
 **The Problem:**
 - Tables with `split_column_families=true` create **multiple Parquet files per UPDATE**
@@ -3499,7 +3499,7 @@ CockroachDB optimizes storage by omitting column families that are entirely NULL
 - ✅ Only new CDC events processed (no reprocessing)
 - ✅ All CDC operations supported (INSERT/UPDATE/DELETE)
 
-**Step 5 Complete: Community Connector Iterator Pattern - 100% (PRODUCTION-READY)**
+**Step 5 Complete: Community Connector Iterator Pattern - 100%**
 - ✅ JSON file support with column family fragmentation (2.0x merge ratio)
 - ✅ Parquet file support (no fragmentation - 1.0x optimized!)  
 - ✅ Format-agnostic deduplication logic
@@ -3524,7 +3524,7 @@ CockroachDB optimizes storage by omitting column families that are entirely NULL
 - ✅ **JSON format support with full CDC operations**
 - ✅ **Initial table deduplication to latest state**
 
-### Production Ready Features
+### Key Features
 - ✅ **RESOLVED timestamp watermarking** (guarantees column family completeness & multi-table consistency)
 - ✅ **Databricks Serverless compatibility** (cluster-agnostic code using Azure SDK)
 - ✅ Column family fragment merging (auto-detects fragmentation)
@@ -3561,24 +3561,24 @@ CockroachDB optimizes storage by omitting column families that are entirely NULL
 1. ✅ **Step 1:** CDC Generation - **COMPLETE!**
 2. ✅ **Step 2:** One-Time Load - **COMPLETE!**
 3. ✅ **Step 3:** Incremental Load - **COMPLETE!**
-4. ✅ **Step 5:** Community Connector - **COMPLETE & PRODUCTION-READY!**
+4. ✅ **Step 5:** Community Connector - **COMPLETE!**
    - ✅ JSON/Parquet format support
    - ✅ Format-agnostic deduplication
    - ✅ Recursive directory reading
    - ✅ File-based modes (no CockroachDB needed)
-5. **Step 4:** DLT + Autoloader (production streaming pipelines) - **NEXT PRIORITY**
+5. **Step 4:** DLT + Autoloader (streaming pipelines) - **NEXT PRIORITY**
 6. Apply deduplication to Azure iterator methods (`_read_table_from_azure_parquet/json`)
 7. Add CI/CD integration with validation mode
 8. Create performance benchmarking suite
 9. Add S3/ABFSS support (currently Azure-only)
 10. Implement continuous streaming with foreachBatch
 
-**Status: ✅ STEPS 1, 2, 3, & 5 COMPLETE (80%) - PRODUCTION-READY FOR FILE-BASED CDC**
+**Status: ✅ STEPS 1, 2, 3, & 5 COMPLETE (80%) - FILE-BASED CDC PROOF OF CONCEPT**
 
 ---
 
 *Last updated: January 21, 2026*  
-*Version: 2.3 - Production-Ready Iterator Pattern (Format-Agnostic)*
+*Version: 2.3 - Iterator Pattern (Format-Agnostic)*
 
 ---
 
@@ -4015,7 +4015,7 @@ elif config.data_source == "gcp_gcs":
    - Parallel RESOLVED file scanning
    - Optimize for very large file counts (10,000+)
 
-**Status: ✅ STEPS 1, 2, 3, 5, & 6 COMPLETE (90%) - DUAL STORAGE PRODUCTION-READY**
+**Status: ✅ STEPS 1, 2, 3, 5, & 6 COMPLETE (90%) - DUAL STORAGE PROOF OF CONCEPT**
 
 ### Key Metrics
 

@@ -208,7 +208,7 @@ UC Volumes **completely eliminate** credential management for Auto Loader operat
        .load("/Volumes/catalog/schema/volume/")
    ```
 
-3. **Production-ready security**
+3. **Governed access**
    - Grant access: `GRANT USE VOLUME ON volume_name TO user`
    - Works across all notebooks
    - Audit logging built-in
