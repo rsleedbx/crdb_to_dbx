@@ -97,17 +97,11 @@ LOCATION azure_cdc_location;
 
 Now you can access CDC files using: `/Volumes/catalog/schema/cdc_volume/parquet/...`
 
-**Benefits:**
-- ✅ Zero credentials in Auto Loader code
-- ✅ Centralized access control with `GRANT` statements
-- ✅ Built-in audit logging
-- ✅ Works with all compute types (including Serverless)
-
 See [Connect to cloud object storage using Unity Catalog](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/) for detailed setup instructions.
 
-### Step 5. Stream into Databricks Delta Lake *(Databricks)*
+### Step 5. Stream into Databricks Delta Lake - Append-Only *(Databricks)*
 
-Use Databricks Auto Loader to automatically ingest CDC files:
+Use Databricks Auto Loader to automatically ingest CDC files in append-only mode (SCD Type 2):
 
 ```python
 from pyspark.sql import functions as F
@@ -163,78 +157,33 @@ ORDER BY _cdc_timestamp;
 
 ### Want more CDC capabilities?
 
-The complete working notebook (`sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`) includes additional CDC modes:
+The complete working notebook (`sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`) includes examples for both CDC modes with standard tables and CockroachDB column families:
 
-| CDC Mode | Target Behavior | Use Case |
-|----------|-----------------|----------|
-| **append_only** | All INSERT, UPDATE, DELETE events stored as rows | Full history (audit logs, compliance) |
-| **update_delete** | Latest INSERT/UPDATE/DELETE state only (MERGE INTO) | Current values (dashboards, reporting) |
+| CDC Mode | Target Behavior | Use Case | Column Family Examples |
+|----------|-----------------|----------|----------------------|
+| **append_only** | All INSERT, UPDATE, DELETE events stored as rows | Full history (audit logs, compliance) | ✅ single_cf, multi_cf |
+| **update_delete** | Latest INSERT/UPDATE/DELETE state only (MERGE INTO) | Current values (dashboards, reporting) | ✅ single_cf, multi_cf |
 
-With support for both standard tables and tables with column families (for write-heavy concurrent workloads).
+**CockroachDB Column Family Support:**
+
+CockroachDB [column families](https://www.cockroachlabs.com/docs/stable/column-families) group columns into separate key-value pairs to optimize write performance in concurrent workloads. When using `split_column_families` in changefeeds, CockroachDB generates multiple Parquet files per row update (one per column family), and the connector automatically merges these fragments.
+
+- **single_cf**: Standard tables (one column family, default behavior)
+  - Changefeed: `WITH format='parquet', updated, resolved='10s'`
+  - One Parquet file per CDC event
+  
+- **multi_cf**: Tables with column families split (`split_column_families`)
+  - Changefeed: `WITH format='parquet', split_column_families, updated, resolved='10s'`
+  - Multiple Parquet files per CDC event (fragments require merging)
+  - Recommended for wide tables (50+ columns) with write-heavy concurrent access patterns
 
 ---
 
 ## Architecture
 
-```
-┌───────────────────────────────────────┐
-│         CockroachDB Cluster           │
-│                                       │
-│  CREATE CHANGEFEED FOR TABLE ...     │
-│  INTO 'azure://...'                   │
-│  WITH format='parquet', resolved      │
-└──────────────┬────────────────────────┘
-               │
-               │ CDC Events (Parquet)
-               ↓
-┌───────────────────────────────────────┐
-│      Azure Blob Storage (ADLS Gen2)   │
-│                                       │
-│  changefeed-events/                   │
-│    └─ parquet/                        │
-│       └─ catalog/schema/table/        │
-│          ├─ data.parquet              │
-│          └─ .RESOLVED                 │
-└──────────────┬────────────────────────┘
-               │
-               │ Governed Access
-               ↓
-┌───────────────────────────────────────┐
-│         Unity Catalog                 │
-│                                       │
-│  Access Control Options:              │
-│  • External Locations (direct)        │
-│  • External Volumes (governed)        │
-│                                       │
-│  Security & Governance Layer          │
-└──────────────┬────────────────────────┘
-               │
-               │ Authorized Access
-               ↓
-┌───────────────────────────────────────┐
-│      Databricks Auto Loader           │
-│                                       │
-│  .format("cloudFiles")                │
-│  .option("cloudFiles.format","parquet")│
-│  .load("abfss://..." or "/Volumes/...")│
-│                                       │
-│  • Automatic file discovery           │
-│  • Schema inference & evolution       │
-│  • Exactly-once semantics             │
-└──────────────┬────────────────────────┘
-               │
-               │ Streaming DataFrame
-               ↓
-┌───────────────────────────────────────┐
-│          Delta Lake Table             │
-│                                       │
-│  • ACID transactions                  │
-│  • Time travel                        │
-│  • Schema evolution                   │
-│  • MERGE support (SCD Type 1)         │
-│  • Append-only (SCD Type 2)           │
-└───────────────────────────────────────┘
-```
+![CDC Architecture Diagram](mermaid-diagram-2026-02-04-193854.png)
+
+*The data flow from CockroachDB through Azure Blob Storage and Unity Catalog to Delta Lake using Databricks Auto Loader. [View Mermaid source](architecture-diagram.mmd)*
 
 ---
 
@@ -359,13 +308,17 @@ result = ingest_cdc_with_merge_multi_family(
 3. Filters CDC events: `__crdb__updated <= watermark`
 4. Guarantees all column family fragments are complete
 
-For multi-table coordination, column family details, and advanced usage, see the [crdb_to_dbx implementation](https://github.com/rsleedbx/crdb_to_dbx/tree/master/crdb_to_dbx).
-
 ---
 
 ## Next Steps
 
-**Complete working notebook**: All CDC modes and examples are available in `sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`.
+**Complete working notebook**: All CDC modes and examples are available in `crdb_to_dbx/cockroachdb-cdc-tutorial.ipynb`.
+
+For multi-table coordination, column family details, and advanced usage examples, see the interactive tutorial notebook which includes:
+- All CDC modes (append-only, update-delete)
+- Both column family configurations (single_cf, multi_cf)
+- RESOLVED watermarking examples
+- Multi-table coordination patterns
 
 **Learn more:**
 - [CockroachDB Changefeed Documentation](https://www.cockroachlabs.com/docs/stable/create-changefeed)

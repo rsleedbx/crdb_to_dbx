@@ -1,0 +1,17 @@
+flowchart TD
+    A["<b>CockroachDB Cluster</b><br/><br/>CREATE CHANGEFEED FOR TABLE ...<br/>INTO 'azure://...'<br/>WITH format='parquet', resolved"]
+    B["<b>Azure Blob Storage (ADLS Gen2)</b><br/><br/>changefeed-events/<br/>  └─ parquet/<br/>    └─ catalog/schema/table/<br/>      ├─ data.parquet<br/>      └─ .RESOLVED"]
+    C["<b>Unity Catalog</b><br/><br/>Access Control Options:<br/>• External Locations (direct)<br/>• External Volumes (governed)<br/><br/>Security & Governance Layer"]
+    D["<b>Databricks Auto Loader</b><br/><br/>.format('cloudFiles')<br/>.option('cloudFiles.format','parquet')<br/>.load('abfss://...' or '/Volumes/...')<br/><br/>• Automatic file discovery<br/>• Schema inference & evolution<br/>• Exactly-once semantics"]
+    E["<b>Delta Lake Table</b><br/><br/>• ACID transactions<br/>• Time travel<br/>• Schema evolution<br/>• MERGE support (SCD Type 1)<br/>• Append-only (SCD Type 2)"]
+
+    A -->|CDC Events<br/>Parquet| B
+    B -->|Governed<br/>Access| C
+    C -->|Authorized<br/>Access| D
+    D -->|Streaming<br/>DataFrame| E
+
+    style A fill:#e1f5ff,stroke:#0078d4,stroke-width:2px
+    style B fill:#fff4e6,stroke:#f59300,stroke-width:2px
+    style C fill:#f0e6ff,stroke:#8b00ff,stroke-width:2px
+    style D fill:#e6f7ff,stroke:#00a4ef,stroke-width:2px
+    style E fill:#e8f5e9,stroke:#4caf50,stroke-width:2px
