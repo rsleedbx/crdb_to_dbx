@@ -106,15 +106,15 @@ This is **desired behavior** in production! Only clear checkpoints during develo
 
 Auto Loader has two file discovery modes:
 
-1. **Notifications** (default for cloud storage)
-   - Uses cloud provider events (Azure Event Grid, AWS SQS, etc.)
-   - Very fast for large directories
-   - **NOT supported for UC Volumes**
+1. **Managed file events** (when enabled on the external location)
+   - Uses cloud provider events; Auto Loader reads from a file-events cache.
+   - **External volumes** can support managed file events (DBR 14.3+, including Serverless) when the feature is enabled on the external location. See [Databricks managed file events](https://docs.databricks.com/en/ingestion/cloud-object-storage/auto-loader/file-events-explained.html).
+   - This connector uses directory listing for UC Volume paths by default for broad compatibility.
 
-2. **Directory Listing** (default for local paths)
-   - Scans directory to find new files
-   - Works for all storage types
-   - Must be explicitly enabled for UC Volumes
+2. **Directory listing** (fallback / default for this connector)
+   - Scans directory to find new files.
+   - Works for all storage types and runtimes.
+   - Used by this connector for UC Volume paths unless you enable managed file events on the location and do not override `cloudFiles.useNotifications`.
 
 ### The Problem
 

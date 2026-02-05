@@ -79,8 +79,10 @@ def _setup_autoloader(spark, source_path, checkpoint_path, source_table):
         .option("recursiveFileLookup", "true")
     )
     
-    # For UC Volumes, explicitly disable notifications (not supported)
-    # and use directory listing instead
+    # For UC Volume paths, use directory listing by default.
+    # Note: Managed file events (cloudFiles.useManagedFileEvents) are supported for
+    # external volumes on DBR 14.3+ and Serverless per Databricks; enable on the
+    # external location and omit this override to use file events when available.
     if is_uc_volume:
         reader = reader.option("cloudFiles.useNotifications", "false")
     

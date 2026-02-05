@@ -119,21 +119,19 @@ if [[ -z "${credentials[storage_resource_id]:-}" ]]; then
 fi
 
 # #############################################################################
-# Optional: Assign RBAC roles to managed identity for enhanced Databricks functionality
-# 
+# Optional: Assign RBAC roles to managed identity (required for managed file events)
+#
 # These role assignments enable:
-# - Automatic file event subscriptions (recommended for Autoloader)
-# - Databricks-managed EventGrid configuration
-# - Future Databricks features that rely on event notifications
+# - Managed file events for Auto Loader (event-driven file discovery; recommended)
+# - Databricks-managed Event Grid subscriptions and queues
 #
-# Requirements:
-# - Owner or User Access Administrator role on the storage account
-# - Owner or User Access Administrator role on the resource group
+# To enable file events:
+# 1. Uncomment the assign_managed_identity_roles call below (requires Owner or
+#    User Access Administrator on the storage account and resource group).
+# 2. Run this script with ENABLE_FILE_EVENTS=1 (e.g. ENABLE_FILE_EVENTS=1 ./01_azure_storage.sh).
 #
-# If you lack these permissions, you can:
-# - Configure file events manually later
-# - Use the access connector without these roles (basic functionality works)
-# - Ask your Azure admin to run this function
+# Without these: the script still creates storage and UC resources; Auto Loader
+# will use directory listing instead of file events.
 # #############################################################################
 
 assign_managed_identity_roles() {
@@ -169,8 +167,9 @@ assign_managed_identity_roles() {
         --scope "${credentials[resource_group_id]}"
 }
 
-# Skip RBAC role assignments by default (uncomment to enable)
-# Requires Owner or User Access Administrator permissions
+# Skip RBAC role assignments by default (uncomment to enable file events)
+# Requires Owner or User Access Administrator permissions on the storage account and resource group.
+# Required for managed file events: Storage Account Contributor, EventGrid EventSubscription Contributor, etc.
 # assign_managed_identity_roles
 
 # create access connector for Databricks Unity Catalog (ignore error if permission denied)
@@ -266,14 +265,29 @@ if [[ -z "${credentials[unity_catalog__external_location]:-}" ]]; then
     credentials[unity_catalog__external_location]="${credentials[azure_storage_account]}"
 fi
 
+# Create external location (optionally with managed file events for Auto Loader)
+# Set ENABLE_FILE_EVENTS=1 and uncomment assign_managed_identity_roles above to use file events.
+EXTERNAL_LOCATION_EXTRA_FLAGS=()
+if [[ -n "${ENABLE_FILE_EVENTS:-}" && "${ENABLE_FILE_EVENTS}" != "0" ]]; then
+    EXTERNAL_LOCATION_EXTRA_FLAGS=(--enable-file-events)
+fi
+
 if ! DBX external-locations get "${credentials[unity_catalog__external_location]}"; then
     DB_EXIT_ON_ERROR="PRINT_EXIT" DBX external-locations create \
         "${credentials[unity_catalog__external_location]}" \
         "${credentials[abfss_base_url]}" \
         "${credentials[unity_catalog__storage_credential_name]}" \
-        --comment "CockroachDB CDC" 
+        --comment "CockroachDB CDC" \
+        "${EXTERNAL_LOCATION_EXTRA_FLAGS[@]}"
     # Save all credentials to JSON
     associative_array_to_json_file credentials "$JSON_FILE"
+else
+    # Optionally enable file events on existing external location (idempotent; no-op if already enabled)
+    if [[ -n "${ENABLE_FILE_EVENTS:-}" && "${ENABLE_FILE_EVENTS}" != "0" ]]; then
+        DB_EXIT_ON_ERROR="PRINT_EXIT" DBX external-locations update \
+            "${credentials[unity_catalog__external_location]}" \
+            --enable-file-events
+    fi
 fi
 
 # #############################################################################
