@@ -92,6 +92,26 @@ Verification: Use the **Test Connection** on the external location in the Databr
 
 ---
 
+## cloudFiles.maxFilesPerTrigger (default: 1000)
+
+**What it does:** `cloudFiles.maxFilesPerTrigger` is the maximum number of **new files** processed in **each trigger** (each microbatch). The default is **1000**. If you also set `cloudFiles.maxBytesPerTrigger`, the effective limit per trigger is the **lower** of the two (file count vs bytes).  
+[Auto Loader options](https://docs.databricks.com/en/ingestion/cloud-object-storage/auto-loader/options.html)
+
+**Interaction with trigger type:** This option **has no effect when used with `Trigger.Once()`** (deprecated) or with **`availableNow=True`**. In those modes, the stream processes all discovered files in that run and then stops; there is no per-trigger cap.
+
+**In this connector:** The CockroachDB CDC connector uses `.trigger(availableNow=True)` for Auto Loader. Each run is a single “process all available files and stop” run. So **`cloudFiles.maxFilesPerTrigger` does not apply** here: every run can process more than 1000 files (all that are discovered). You do not need to set or tune it for this connector.
+
+**For other use cases (continuous streaming):** When the stream uses a **recurring trigger** (e.g. `ProcessingTime("1 minute")`), `maxFilesPerTrigger` *does* apply. Each trigger then processes at most 1000 new files. That keeps microbatches bounded and is usually sufficient; you would only change it if you need smaller (e.g. 100) or larger (e.g. 5000) microbatches for latency or throughput.
+
+| Scenario | Effect of default 1000 |
+|----------|------------------------|
+| **Stream runs once** (e.g. `availableNow=True`, `Trigger.Once()`) | No effect. All discovered files in that run are processed. |
+| **Continuous / recurring trigger** (e.g. `ProcessingTime("1 minute")`) | Each trigger processes **up to 1000** new files. Extra files are processed in later triggers. |
+| **Few files per trigger** (e.g. tens or hundreds) | Default is fine; all new files are processed in that trigger. |
+| **Burst of many files** (e.g. 50k at once) | With default 1000, each trigger does at most 1000 files → more triggers, smaller batches, lower memory per batch. |
+
+---
+
 ## References (public documentation only)
 
 - [Auto Loader with file events overview](https://docs.databricks.com/en/ingestion/cloud-object-storage/auto-loader/file-events-explained.html)
