@@ -45,6 +45,8 @@ The connector uses JSON configuration files with the following structure:
 }
 ```
 
+Optional in `cdc_config`: **`checkpoint_base_path`** — base path for streaming checkpoints. If omitted, default is `/Volumes/{destination_catalog}/{destination_schema}/checkpoints` (create a Volume named `checkpoints` in the target schema).
+
 ## Quick Start
 
 1. **Copy an example config:**

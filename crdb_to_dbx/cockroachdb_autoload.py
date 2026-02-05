@@ -15,7 +15,7 @@ from cockroachdb.py that includes the deduplicate_to_latest_state parameter
 for robust NULL handling in column families.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Union
 from pyspark.sql import functions as F
 from datetime import datetime
 
@@ -24,21 +24,42 @@ from datetime import datetime
 # HELPER FUNCTIONS - ALL MODES
 # ============================================================================
 
-def _build_paths(config, mode_suffix=""):
+def _ensure_checkpoint_volume(spark, checkpoint_base_path: str) -> None:
+    """
+    If checkpoint_base_path is a Unity Catalog Volume path (/Volumes/catalog/schema/volume_name),
+    create the volume if it does not exist. No-op for non-Volume paths (e.g. cloud storage).
+    """
+    path = (checkpoint_base_path or "").strip().rstrip("/")
+    if not path.startswith("/Volumes/"):
+        return
+    parts = path[len("/Volumes/"):].split("/")
+    if len(parts) < 3:
+        return
+    # Volume FQN = catalog.schema.volume_name (first three path segments)
+    catalog, schema, volume_name = parts[0], parts[1], parts[2]
+    volume_fqn = f"{catalog}.{schema}.{volume_name}"
+    spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_fqn}")
+    print(f"   ✅ Checkpoint volume ensured: {volume_fqn}")
+
+
+def _build_paths(config, mode_suffix="", spark=None):
     """
     Build source, checkpoint, and target paths from config.
     
-    Supports both Azure storage and UC external volume based on data_source configuration.
+    Checkpoint path = config.cdc_config.checkpoint_base_path / table_name [+ mode_suffix].
+    The default for checkpoint_base_path is built in cockroachdb_config.process_config
+    (/Volumes/{destination_catalog}/{destination_schema}/checkpoints). Override via cdc_config in JSON.
     
     Args:
-        config: Config dataclass from cockroachdb_config.py
+        config: Config dataclass from cockroachdb_config (must be process_config output so checkpoint_base_path is set).
         mode_suffix: Optional suffix for checkpoint path (e.g., "_merge", "_merge_cf")
+        spark: Unused; kept for API compatibility.
     
     Returns:
         tuple: (source_path, checkpoint_path, target_table_fqn)
     
     Raises:
-        ValueError: If data source is not properly configured
+        ValueError: If checkpoint_base_path is missing or empty, or data source is not properly configured
     """
     # Import here to avoid circular dependency
     from cockroachdb_config import get_storage_path
@@ -46,8 +67,26 @@ def _build_paths(config, mode_suffix=""):
     # Get source path based on data source
     source_path = get_storage_path(config)
     
-    checkpoint_path = f"/checkpoints/{config.tables.destination_schema}_{config.tables.destination_table_name}{mode_suffix}"
-    target_table_fqn = f"{config.tables.destination_catalog}.{config.tables.destination_schema}.{config.tables.destination_table_name}"
+    catalog = config.tables.destination_catalog
+    schema = config.tables.destination_schema
+    table_name = config.tables.destination_table_name
+    target_table_fqn = f"{catalog}.{schema}.{table_name}"
+
+    # Checkpoint base path is set in config (default built in cockroachdb_config.process_config)
+    if not hasattr(config.cdc_config, "checkpoint_base_path"):
+        raise ValueError(
+            "config.cdc_config.checkpoint_base_path is required. "
+            "Load config with cockroachdb_config.load_and_process_config() so the default is set."
+        )
+    base = config.cdc_config.checkpoint_base_path
+    if not base or not str(base).strip():
+        raise ValueError(
+            "config.cdc_config.checkpoint_base_path must be non-empty. "
+            "Set it in cdc_config (e.g. \"/Volumes/catalog/schema/checkpoints\") or ensure process_config builds the default."
+        )
+    base = str(base).strip().rstrip("/")
+    checkpoint_path = f"{base}/{table_name}{mode_suffix}"
+
     return source_path, checkpoint_path, target_table_fqn
 
 
@@ -87,61 +126,39 @@ def _setup_autoloader(spark, source_path, checkpoint_path, source_table):
     return reader.load(source_path)
 
 
-def _transform_cdc_columns(raw_df, resolved_watermark: Optional[int] = None):
+def _transform_cdc_columns(raw_df, resolved_watermark: Optional[str] = None):
     """
     Transform CockroachDB CDC columns to standard format.
     
-    Converts:
-    - __crdb__updated (nanoseconds) → _cdc_timestamp (timestamp)
+    - Keeps __crdb__updated as full HLC string ("WallTime.Logical"); used for ordering and MERGE.
+      For display, use __crdb__updated as-is (full HLC) to avoid confusion; do not drop the logical part.
     - __crdb__event_type ('d'/'c'/'r') → _cdc_operation ('DELETE'/'UPSERT')
     
     Optionally filters by RESOLVED timestamp watermark to guarantee completeness.
     
     Args:
         raw_df: Raw DataFrame from Auto Loader
-        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+        resolved_watermark: Optional RESOLVED timestamp as HLC string ("WallTime.Logical").
                            If provided, only events with __crdb__updated <= watermark are kept.
                            This GUARANTEES all column family fragments have arrived.
     
     Returns:
-        DataFrame: Transformed DataFrame with standard CDC columns
+        DataFrame: Transformed DataFrame with __crdb__updated, _cdc_operation (drops __crdb__event_type only)
     """
-    # Helper function to extract wall time from CockroachDB HLC timestamp
-    # __crdb__updated format: "1770067697320026017.0000000002" (wall_time.logical)
-    # We extract just the wall_time part (before decimal) for filtering and conversion
-    def extract_wall_time(col):
-        """Extract wall time nanoseconds from CockroachDB HLC timestamp string."""
-        return F.split(F.col(col), "\\.")[0].cast("bigint")
-    
     df = raw_df.select(
         "*",
-        # Convert __crdb__updated (nanoseconds) to timestamp
-        # Extract wall time from HLC format (before decimal point)
-        F.from_unixtime(
-            extract_wall_time("__crdb__updated") / 1000000000
-        ).cast("timestamp").alias("_cdc_timestamp"),
-        # Map event type
         F.when(F.col("__crdb__event_type") == "d", "DELETE")
          .otherwise("UPSERT")
          .alias("_cdc_operation")
-    ).drop("__crdb__event_type", "__crdb__updated")
-    
-    # Apply RESOLVED watermark filtering if provided
+    ).drop("__crdb__event_type")
+    # Keep __crdb__updated as-is (HLC string); lexicographic order matches HLC order.
+
     if resolved_watermark is not None:
-        print(f"   🔒 Applying RESOLVED watermark filter: timestamp ≤ {resolved_watermark}")
-        # Note: raw_df still has __crdb__updated before drop, so filter on original df
-        # Extract wall time and compare with watermark
-        df = raw_df.filter(extract_wall_time("__crdb__updated") <= resolved_watermark).select(
-            "*",
-            F.from_unixtime(
-                extract_wall_time("__crdb__updated") / 1000000000
-            ).cast("timestamp").alias("_cdc_timestamp"),
-            F.when(F.col("__crdb__event_type") == "d", "DELETE")
-             .otherwise("UPSERT")
-             .alias("_cdc_operation")
-        ).drop("__crdb__event_type", "__crdb__updated")
+        # resolved_watermark is already an HLC string (same format as __crdb__updated); lex order = HLC order.
+        print(f"   🔒 Applying RESOLVED watermark filter: __crdb__updated ≤ {resolved_watermark}")
+        df = df.filter(F.col("__crdb__updated") <= resolved_watermark)
         print(f"   ✅ RESOLVED watermark applied - only complete data will be processed")
-    
+
     return df
 
 
@@ -177,7 +194,7 @@ def _print_ingestion_header(config, mode, column_family_mode, source_path, targe
     print()
 
 
-def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[int]:
+def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[str]:
     """
     Get the latest RESOLVED timestamp watermark from CockroachDB CDC .RESOLVED files.
     
@@ -186,13 +203,13 @@ def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[i
     
     Supports both Azure Blob Storage and Unity Catalog external volumes.
     
-    How it works:
-    1. Reads all .RESOLVED files for the source table from storage (Azure or UC Volume)
-    2. Extracts the resolved timestamp from the filename (nanoseconds since epoch)
-    3. Returns the MAXIMUM resolved timestamp (latest safe watermark)
+    RESOLVED filename format (CockroachDB cloud storage sink, single format):
+    - Filename: `<timestamp>.RESOLVED` where timestamp = cloudStorageFormatTime(ts):
+      YYYYMMDDHHMMSS (14) + NNNNNNNNN (9 nanos) + LLLLLLLLLL (10 logical) = 33 digits.
+    - See pkg/ccl/changefeedccl/sink_cloudstorage.go cloudStorageFormatTime().
     
-    RESOLVED filename format: <table>.RESOLVED.<nanos>
-    Example: ycsb.RESOLVED.1704067200000000000
+    We convert each to "WallTime.Logical" (same as __crdb__updated) for comparison;
+    lexicographic order = HLC order.
     
     Args:
         config: Configuration object with storage credentials
@@ -200,13 +217,10 @@ def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[i
         spark: SparkSession (required for UC Volume, optional for Azure)
     
     Returns:
-        int: Latest RESOLVED timestamp in nanoseconds, or None if no RESOLVED files found
+        Latest RESOLVED timestamp as HLC string, or None if no RESOLVED files found.
     
-    Example:
-        >>> watermark = _get_resolved_watermark(config, "ycsb", spark)
-        >>> if watermark:
-        >>>     print(f"Safe to process events up to {watermark} nanos")
-        >>>     df = df.filter(F.col("__crdb__updated") <= watermark)
+    Raises:
+        ValueError: If any RESOLVED filename is not the 33-digit CockroachDB format.
     """
     try:
         # Check data source and use appropriate module
@@ -278,103 +292,52 @@ def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[i
         if resolved_files:
             print(f"   📄 Example RESOLVED file: {resolved_files[0]['name']}")
         
-        # Extract timestamps from filenames
-        # CockroachDB RESOLVED file formats (observed patterns):
-        # - Format 1: <timestamp_nanos>.RESOLVED (e.g., 1738468800000000000.RESOLVED)
-        # - Format 2: <timestamp>-<jobid>-...-<table>.RESOLVED (CDC file naming pattern)
-        # - Format 3: path/to/<timestamp>.RESOLVED.parquet
-        timestamps = []
+        # CockroachDB uses a single format: cloudStorageFormatTime(ts) = 33 digits (YYYYMMDDHHMMSS + 9 nanos + 10 logical).
+        # Filename is "<33 digits>.RESOLVED". Convert each to "WallTime.Logical" to match __crdb__updated.
+        from datetime import datetime as dt
+
+        hlc_strings = []
         for file in resolved_files:
+            full_path = file['name']
+            filename = full_path.split('/')[-1]
+            if filename.endswith('.parquet'):
+                filename = filename[:-8]
+            # Filename is "<33 digits>.RESOLVED" per CockroachDB cloudStorageFormatTime()
+            first_part = filename.split('.')[0]
+            if not first_part.isdigit() or len(first_part) != 33:
+                raise ValueError(
+                    f"RESOLVED filename must be 33-digit CockroachDB format (YYYYMMDDHHMMSS+9nanos+10logical): got {filename!r} (first_part={first_part!r}, len={len(first_part)})"
+                )
             try:
-                # Get just the filename (not the full path)
-                # All storage backends now return dicts with ['name'] key
-                full_path = file['name']
-                filename = full_path.split('/')[-1]  # Get last part after /
-                
-                # Remove .parquet extension if present
-                if filename.endswith('.parquet'):
-                    filename = filename[:-8]  # Remove '.parquet'
-                
-                # The timestamp is typically the FIRST part (before first dash or dot)
-                # Split by dash first (for CDC file naming pattern)
-                if '-' in filename:
-                    first_part = filename.split('-')[0]
-                else:
-                    # Split by dot (for simple timestamp.RESOLVED format)
-                    first_part = filename.split('.')[0]
-                
-                # Parse timestamp based on format
-                # CockroachDB uses HLC (Hybrid Logical Clock) timestamps in RESOLVED filenames
-                if first_part.isdigit():
-                    timestamp_str = first_part
-                    
-                    # CockroachDB HLC format (33 digits): YYYYMMDDHHMMSS + NNNNNNNNN + LLLLLLLLLL
-                    # where: 14 digits datetime + 9 digits nanos + 10 digits logical
-                    if len(timestamp_str) == 33:
-                        # Parse CockroachDB HLC format
-                        from datetime import datetime as dt
-                        
-                        # Extract components
-                        datetime_part = timestamp_str[:14]  # YYYYMMDDHHMMSS
-                        nanos_part = timestamp_str[14:23]    # 9 digits
-                        logical_part = timestamp_str[23:33]  # 10 digits
-                        
-                        # Convert datetime to Unix timestamp
-                        year = int(datetime_part[0:4])
-                        month = int(datetime_part[4:6])
-                        day = int(datetime_part[6:8])
-                        hour = int(datetime_part[8:10])
-                        minute = int(datetime_part[10:12])
-                        second = int(datetime_part[12:14])
-                        
-                        dt_obj = dt(year, month, day, hour, minute, second)
-                        unix_seconds = int(dt_obj.timestamp())
-                        
-                        # Convert to nanoseconds and add nanosecond component
-                        timestamp_nanos = (unix_seconds * 1_000_000_000) + int(nanos_part)
-                        timestamps.append(timestamp_nanos)
-                        
-                    # Standard Unix nanosecond timestamp (19 digits)
-                    elif 18 <= len(timestamp_str) <= 19:
-                        timestamp_nanos = int(timestamp_str)
-                        if timestamp_nanos < 10_000_000_000_000_000_000:
-                            timestamps.append(timestamp_nanos)
-                        else:
-                            print(f"   ⚠️  Timestamp out of valid range: {timestamp_str}")
-                    else:
-                        print(f"   ⚠️  Unexpected timestamp length ({len(timestamp_str)} digits): {timestamp_str}")
-                else:
-                    print(f"   ⚠️  Could not extract timestamp from: {filename} (first_part={first_part})")
-            except (IndexError, ValueError) as e:
-                print(f"   ⚠️  Skipping malformed RESOLVED file: {full_path} ({e})")
-                continue
-        
-        if not timestamps:
-            print(f"   ⚠️  No valid .RESOLVED timestamps found")
-            print(f"      Check RESOLVED file naming format")
+                datetime_part = first_part[:14]
+                nanos_part = first_part[14:23]
+                logical_part = first_part[23:33]
+                year, month, day = int(datetime_part[0:4]), int(datetime_part[4:6]), int(datetime_part[6:8])
+                hour, minute, second = int(datetime_part[8:10]), int(datetime_part[10:12]), int(datetime_part[12:14])
+                dt_obj = dt(year, month, day, hour, minute, second)
+                unix_seconds = int(dt_obj.timestamp())
+                wall_nanos = (unix_seconds * 1_000_000_000) + int(nanos_part)
+                hlc_strings.append(f"{wall_nanos}.{logical_part}")
+            except (ValueError, IndexError) as e:
+                raise ValueError(f"Malformed RESOLVED timestamp in filename: {full_path}") from e
+
+        if not hlc_strings:
             return None
-        
-        # Get the MAXIMUM (latest) RESOLVED timestamp
-        max_resolved = max(timestamps)
-        
-        # Convert to human-readable datetime for logging
+        # Lexicographic order of "WallTime.Logical" = HLC order
+        max_resolved_hlc = max(hlc_strings)
+        wall_part = max_resolved_hlc.split('.')[0]
         try:
-            max_resolved_seconds = max_resolved / 1_000_000_000
+            max_resolved_seconds = int(wall_part) / 1_000_000_000
             max_resolved_dt = datetime.fromtimestamp(max_resolved_seconds)
             datetime_str = max_resolved_dt.strftime('%Y-%m-%d %H:%M:%S')
-        except (ValueError, OSError, OverflowError) as e:
-            # Timestamp out of range for datetime conversion
-            print(f"   ⚠️  Could not convert timestamp to datetime: {e}")
-            datetime_str = f"<timestamp: {max_resolved} nanos>"
-        
+        except (ValueError, OSError, OverflowError):
+            datetime_str = max_resolved_hlc
         print(f"   ✅ Found {len(resolved_files)} .RESOLVED file(s)")
-        print(f"   ✅ Latest RESOLVED watermark: {max_resolved} nanos")
+        print(f"   ✅ Latest RESOLVED watermark (HLC): {max_resolved_hlc}")
         print(f"      ({datetime_str} UTC)")
-        print(f"   💡 Only events with timestamp ≤ {max_resolved} will be processed")
-        print(f"      This GUARANTEES all column family fragments have arrived")
+        print(f"   💡 Only events with __crdb__updated ≤ {max_resolved_hlc} will be processed")
         print()
-        
-        return max_resolved
+        return max_resolved_hlc
         
     except Exception as e:
         print(f"   ⚠️  Error reading .RESOLVED files: {e}")
@@ -385,32 +348,21 @@ def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[i
 def _resolve_watermark(
     config,
     source_table: str,
-    resolved_watermark: Optional[int],
+    resolved_watermark: Optional[str],  # HLC string "WallTime.Logical"; do not pass int
     is_multi_cf: bool = False,
     spark=None
-) -> Optional[int]:
+) -> Optional[str]:
     """
-    Resolve the RESOLVED watermark to use for CDC ingestion.
-    
-    This helper consolidates watermark resolution logic across all ingestion functions.
-    Supports both Azure Blob Storage and Unity Catalog external volumes.
+    Resolve the RESOLVED watermark as an HLC string for comparison with __crdb__updated.
     
     Logic:
-    1. If watermark disabled in config: Return None (no watermarking)
-    2. If watermark provided by caller: Use it (multi-table coordination)
-    3. Otherwise: Compute from .RESOLVED files (using Azure SDK or Spark listing)
-    
-    Args:
-        config: Config dataclass with storage credentials
-        source_table: Source table name
-        resolved_watermark: Optional watermark provided by caller
-        is_multi_cf: True if multi-CF mode (affects warning messages)
-        spark: SparkSession (required for UC Volume, optional for Azure)
+    1. If watermark disabled in config: Return None
+    2. If watermark provided by caller: Must be HLC string (raise if int)
+    3. Otherwise: Compute from .RESOLVED files (returns HLC string)
     
     Returns:
-        int: RESOLVED timestamp in nanoseconds, or None if disabled/unavailable
+        str: HLC string (e.g. "1770067697320026017.0000000005"), or None if disabled/unavailable
     """
-    # Check if RESOLVED watermarking is enabled in config
     if not config.cdc_config.use_resolved_watermark:
         print("⚠️  RESOLVED Watermarking: DISABLED")
         if is_multi_cf:
@@ -419,16 +371,20 @@ def _resolve_watermark(
         print()
         return None
     
-    # RESOLVED watermarking is enabled
     if resolved_watermark is not None:
-        # Watermark provided by caller (multi-table coordination)
+        # Caller must provide full HLC string; we do not accept int (would invent logical and cause confusion).
+        if isinstance(resolved_watermark, int):
+            raise TypeError(
+                "resolved_watermark must be an HLC string (e.g. 'WallTime.Logical'), not int. "
+                "Use _get_resolved_watermark() to get the full HLC from .RESOLVED files, or pass the HLC string from your source."
+            )
+        watermark_str = str(resolved_watermark)
         print(f"🔒 RESOLVED Watermarking: ENABLED (provided by caller)")
-        print(f"   Using watermark: {resolved_watermark} nanos")
+        print(f"   Using watermark (HLC): {watermark_str}")
         if is_multi_cf:
             print(f"   This GUARANTEES all column family fragments are complete before processing")
-        print(f"   💡 Shared watermark ensures consistency across multiple tables")
         print()
-        return resolved_watermark
+        return watermark_str
     
     # Compute watermark from .RESOLVED files
     if is_multi_cf:
@@ -462,7 +418,7 @@ def _stream_to_staging(df, checkpoint_path, staging_table_fqn):
     - Multi-CF functions: Need staging for column family merging
     
     Args:
-        df: Transformed DataFrame (with _cdc_timestamp, _cdc_operation)
+        df: Transformed DataFrame (with __crdb__updated, _cdc_operation)
         checkpoint_path: Checkpoint location base path
         staging_table_fqn: Fully qualified staging table name
     
@@ -543,7 +499,8 @@ def _merge_staging_to_target(spark, staging_table_fqn, target_table_fqn, primary
     # STEP 2: Deduplication
     # ============================================================================
     print(f"   🔄 Deduplicating by primary keys: {primary_key_columns}...")
-    window_spec = Window.partitionBy(*primary_key_columns).orderBy(F.col("_cdc_timestamp").desc())
+    # Order by __crdb__updated (HLC string); lexicographic order = HLC order for latest-per-key
+    window_spec = Window.partitionBy(*primary_key_columns).orderBy(F.col("__crdb__updated").desc())
     staging_df = (staging_df_raw
         .withColumn("_row_num", F.row_number().over(window_spec))
         .filter(F.col("_row_num") == 1)
@@ -611,37 +568,43 @@ def _merge_staging_to_target(spark, staging_table_fqn, target_table_fqn, primary
         # ========================================================================
         delta_table = DeltaTable.forName(spark, target_table_fqn)
         
-        # Check if _cdc_operation exists in target
+        # Require __crdb__updated and _cdc_operation on target (no ALTER; fail if missing)
         target_columns = set(spark.read.table(target_table_fqn).columns)
+        if "__crdb__updated" not in target_columns:
+            raise ValueError(
+                "Target table is missing __crdb__updated. MERGE requires this column. "
+                "Ensure the table was created by the connector pipeline that keeps __crdb__updated."
+            )
         if "_cdc_operation" not in target_columns:
-            print(f"   ⚠️  Target table missing _cdc_operation column (old schema)")
-            print(f"   🔧 Adding _cdc_operation column for observability...")
-            spark.sql(f"""
-                ALTER TABLE {target_table_fqn} 
-                ADD COLUMN _cdc_operation STRING
-            """)
-            print(f"   ✅ Column added\n")
+            raise ValueError(
+                "Target table is missing _cdc_operation. MERGE requires this column. "
+                "Ensure the table was created by the connector pipeline that adds _cdc_operation."
+            )
         
-        # Build and execute MERGE
+        # Build and execute MERGE. __crdb__updated is HLC string; lexicographic order = HLC order.
         join_condition = " AND ".join([f"target.{col} = source.{col}" for col in primary_key_columns])
         data_columns = [col for col in staging_df.columns]
         update_set = {col: f"source.{col}" for col in data_columns}
         insert_values = {col: f"source.{col}" for col in data_columns}
-        
+        merge_time_condition = (
+            "target.__crdb__updated IS NULL OR source.__crdb__updated > target.__crdb__updated"
+        )
         print(f"   🔄 Executing MERGE...")
         print(f"      Join: {join_condition}")
-        print(f"      ℹ️  _cdc_operation will be preserved for monitoring")
+        print(f"      Order: whenMatchedDelete first (so DELETEs remove rows before any update), then whenMatchedUpdate, then whenNotMatchedInsert")
+        print(f"      Update when: UPSERT and source.__crdb__updated > target.__crdb__updated")
         
+        # Order matters: first matching clause wins. Put DELETE first so matched rows are removed, not updated with DELETE payload.
         (delta_table.alias("target").merge(
             staging_df.alias("source"),
             join_condition
         )
-        .whenMatchedUpdate(
-            condition="source._cdc_operation = 'UPSERT' AND source._cdc_timestamp > target._cdc_timestamp",
-            set=update_set
-        )
         .whenMatchedDelete(
             condition="source._cdc_operation = 'DELETE'"
+        )
+        .whenMatchedUpdate(
+            condition=f"source._cdc_operation = 'UPSERT' AND {merge_time_condition}",
+            set=update_set
         )
         .whenNotMatchedInsert(
             condition="source._cdc_operation = 'UPSERT'",
@@ -687,15 +650,16 @@ def ingest_cdc_append_only_single_family(
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
-        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+        resolved_watermark: Optional RESOLVED timestamp as HLC string ("WallTime.Logical"); do not pass int.
                            If provided, uses this watermark (for multi-table coordination).
                            If None, will compute from .RESOLVED files if enabled.
     
     Returns:
         StreamingQuery object
     """
-    # Build paths using helper
-    source_path, checkpoint_path, target_table_fqn = _build_paths(config)
+    # Build paths using helper (checkpoint on target schema, directory name = table name)
+    source_path, checkpoint_path, target_table_fqn = _build_paths(config, spark=spark)
+    _ensure_checkpoint_volume(spark, config.cdc_config.checkpoint_base_path)
     
     # Print ingestion header
     _print_ingestion_header(config, "append_only", "single_cf", source_path, target_table_fqn)
@@ -760,12 +724,12 @@ def ingest_cdc_with_merge_single_family(
     Target table will contain:
     - All data columns from source
     - _cdc_operation: "UPSERT" (shows last operation on each row)
-    - _cdc_timestamp: Timestamp of last CDC event
+    - __crdb__updated: HLC timestamp string (e.g. WallTime.Logical); display as-is (full HLC) to avoid confusion
     
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
-        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+        resolved_watermark: Optional RESOLVED timestamp as HLC string ("WallTime.Logical"); do not pass int.
                            If provided, uses this watermark (for multi-table coordination).
                            If None, will compute from .RESOLVED files if enabled.
     
@@ -775,8 +739,9 @@ def ingest_cdc_with_merge_single_family(
     from pyspark.sql import functions as F, Window
     from delta.tables import DeltaTable
     
-    # Build paths using helper (with "_merge" suffix for checkpoint)
-    source_path, checkpoint_path, target_table_fqn = _build_paths(config, mode_suffix="_merge")
+    # Build paths using helper (checkpoint on target schema, directory = table name + _merge)
+    source_path, checkpoint_path, target_table_fqn = _build_paths(config, mode_suffix="_merge", spark=spark)
+    _ensure_checkpoint_volume(spark, config.cdc_config.checkpoint_base_path)
     
     # Get primary key columns from config
     primary_key_columns = config.cdc_config.primary_key_columns
@@ -843,7 +808,7 @@ def ingest_cdc_with_merge_single_family(
     print("📋 Target table includes:")
     print("   - All data columns from source")
     print("   - _cdc_operation: UPSERT (for monitoring)")
-    print("   - _cdc_timestamp: Last CDC event timestamp")
+    print("   - __crdb__updated: HLC timestamp (display as-is, full HLC)")
     print()
     print("💡 TIP: Staging table can be dropped after successful MERGE:")
     print(f"   spark.sql('DROP TABLE IF EXISTS {staging_table_fqn}')")
@@ -985,7 +950,7 @@ def merge_column_family_fragments(
     if metadata_columns is None:
         metadata_columns = [
             '__crdb__event_type', '__crdb__updated', '_rescued_data',
-            '_cdc_operation', '_cdc_timestamp', '_cdc_updated', '_source_file', '_processing_time',
+            '_cdc_operation', '_cdc_updated', '_source_file', '_processing_time',
             '_metadata',  # Unity Catalog metadata
             # JSON envelope columns (should not be merged as data columns)
             'after', 'before', 'key', 'updated',
@@ -995,6 +960,16 @@ def merge_column_family_fragments(
     
     # Get all columns from DataFrame
     all_columns = df.columns
+    if '__crdb__updated' not in all_columns:
+        raise ValueError(
+            "DataFrame is missing __crdb__updated. Column family merge requires the CDC timestamp column. "
+            "Ensure the DataFrame was produced by the connector's apply_cdc_transform that keeps __crdb__updated."
+        )
+    if '_cdc_operation' not in all_columns:
+        raise ValueError(
+            "DataFrame is missing _cdc_operation. Column family merge requires the CDC operation column (DELETE/UPSERT). "
+            "Ensure the DataFrame was produced by the connector's apply_cdc_transform that adds _cdc_operation."
+        )
     
     # Identify data columns (everything except PK and metadata)
     data_columns = [
@@ -1027,45 +1002,19 @@ def merge_column_family_fragments(
     # For streaming mode: Always merge (can't count streaming DataFrames)
     if not is_streaming:
         try:
-            # Determine timestamp column for fragmentation detection
-            timestamp_col_for_check = None
-            if '_cdc_timestamp' in all_columns:
-                timestamp_col_for_check = '_cdc_timestamp'
-            elif '_cdc_updated' in all_columns:
-                timestamp_col_for_check = '_cdc_updated'
-            elif '__crdb__updated' in all_columns:
-                timestamp_col_for_check = '__crdb__updated'
-            elif 'updated' in all_columns:
-                timestamp_col_for_check = 'updated'
+            # Timestamp column (required; checked at function entry)
+            timestamp_col_for_check = '__crdb__updated'
             
             # Try to detect fragmentation
             total_rows = df.count()
             
-            if timestamp_col_for_check and '_cdc_operation' in all_columns:
-                # Check for fragmentation at (PK + timestamp + operation) level
-                # This preserves all distinct CDC events (same key can have UPDATE + DELETE at same timestamp)
-                unique_events = df.select(primary_key_columns + [timestamp_col_for_check, '_cdc_operation']).distinct().count()
-            elif timestamp_col_for_check:
-                # Fallback: check at (PK + timestamp) level
-                unique_events = df.select(primary_key_columns + [timestamp_col_for_check]).distinct().count()
-            elif '_cdc_operation' in all_columns:
-                # Fallback: check at (PK + operation) level
-                unique_events = df.select(primary_key_columns + ['_cdc_operation']).distinct().count()
-            else:
-                # Fallback: check at PK level only
-                unique_events = df.select(primary_key_columns).distinct().count()
+            # Check for fragmentation at (PK + timestamp + operation) level (required; checked at function entry)
+            unique_events = df.select(primary_key_columns + [timestamp_col_for_check, '_cdc_operation']).distinct().count()
             
             if debug:
                 print(f"\n📊 Fragmentation Detection:")
                 print(f"   Total rows: {total_rows:,}")
-                if timestamp_col_for_check and '_cdc_operation' in all_columns:
-                    print(f"   Unique events (PK + timestamp + operation): {unique_events:,}")
-                elif timestamp_col_for_check:
-                    print(f"   Unique events (PK + timestamp): {unique_events:,}")
-                elif '_cdc_operation' in all_columns:
-                    print(f"   Unique events (PK + operation): {unique_events:,}")
-                else:
-                    print(f"   Unique keys (PK only): {unique_events:,}")
+                print(f"   Unique events (PK + timestamp + operation): {unique_events:,}")
                 print(f"   Duplication ratio: {total_rows / unique_events if unique_events > 0 else 0:.1f}x")
             
             # If no duplicates, return original DataFrame
@@ -1100,65 +1049,50 @@ def merge_column_family_fragments(
             print(f"\n🔄 Applying cross-time coalescing + deduplication...")
             print(f"   (Preserves latest non-NULL value per column across all events)")
         
-        # Determine timestamp column for ordering
-        timestamp_col_for_coalesce = None
-        if '_cdc_timestamp' in all_columns:
-            timestamp_col_for_coalesce = '_cdc_timestamp'
-        elif '_cdc_updated' in all_columns:
-            timestamp_col_for_coalesce = '_cdc_updated'
-        elif '__crdb__updated' in all_columns:
-            timestamp_col_for_coalesce = '__crdb__updated'
-        elif 'updated' in all_columns:
-            timestamp_col_for_coalesce = 'updated'
+        # Timestamp column (required; checked at function entry)
+        timestamp_col_for_coalesce = '__crdb__updated'
+        # Step 1: Coalesce columns across time (keep latest non-NULL value per column)
+        if debug:
+            print(f"   Step 1: Coalescing columns by primary keys: {primary_key_columns}...")
+            print(f"           Using last_value(col, ignorenulls=True) per column")
         
-        if not timestamp_col_for_coalesce:
-            if debug:
-                print(f"   ⚠️  No timestamp column found - cannot coalesce across time")
-                print(f"   Falling back to standard merge mode")
-        else:
-            # Step 1: Coalesce columns across time (keep latest non-NULL value per column)
-            if debug:
-                print(f"   Step 1: Coalescing columns by primary keys: {primary_key_columns}...")
-                print(f"           Using last_value(col, ignorenulls=True) per column")
-            
-            # Window spec: partition by PK, order by timestamp, look at all rows
-            window_spec_coalesce = (Window.partitionBy(*primary_key_columns)
-                .orderBy(F.col(timestamp_col_for_coalesce))
-                .rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing))
-            
-            # For each data column, coalesce to latest non-NULL value
-            for col in data_columns:
-                df = df.withColumn(
-                    col,
-                    F.last(F.col(col), ignorenulls=True).over(window_spec_coalesce)
-                )
-            
-            # Also coalesce _cdc_operation to the LATEST value (for DELETE handling)
-            if '_cdc_operation' in all_columns:
-                df = df.withColumn(
-                    "_cdc_operation",
-                    F.last(F.col("_cdc_operation"), ignorenulls=True).over(window_spec_coalesce)
-                )
-            
-            if debug:
-                print(f"   ✅ Columns coalesced (latest non-NULL value per column)")
-            
-            # Step 2: Deduplicate by primary key (keep LATEST row, which now has ALL coalesced columns)
-            if debug:
-                print(f"   Step 2: Deduplicating by primary keys: {primary_key_columns}...")
-            
-            window_spec_dedup = Window.partitionBy(*primary_key_columns).orderBy(F.col(timestamp_col_for_coalesce).desc())
-            df_merged = (df
-                .withColumn("_row_num", F.row_number().over(window_spec_dedup))
-                .filter(F.col("_row_num") == 1)
-                .drop("_row_num")
+        # Window spec: partition by PK, order by timestamp, look at all rows
+        window_spec_coalesce = (Window.partitionBy(*primary_key_columns)
+            .orderBy(F.col(timestamp_col_for_coalesce))
+            .rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing))
+        
+        # For each data column, coalesce to latest non-NULL value
+        for col in data_columns:
+            df = df.withColumn(
+                col,
+                F.last(F.col(col), ignorenulls=True).over(window_spec_coalesce)
             )
-            
-            if debug:
-                print(f"   ✅ Deduplication complete!")
-                print(f"      Result: Latest state per primary key with all column values preserved")
-            
-            return df_merged
+        
+        # Also coalesce _cdc_operation to the LATEST value (for DELETE handling) (required; checked at function entry)
+        df = df.withColumn(
+            "_cdc_operation",
+            F.last(F.col("_cdc_operation"), ignorenulls=True).over(window_spec_coalesce)
+        )
+        
+        if debug:
+            print(f"   ✅ Columns coalesced (latest non-NULL value per column)")
+        
+        # Step 2: Deduplicate by primary key (keep LATEST row, which now has ALL coalesced columns)
+        if debug:
+            print(f"   Step 2: Deduplicating by primary keys: {primary_key_columns}...")
+        
+        window_spec_dedup = Window.partitionBy(*primary_key_columns).orderBy(F.col(timestamp_col_for_coalesce).desc())
+        df_merged = (df
+            .withColumn("_row_num", F.row_number().over(window_spec_dedup))
+            .filter(F.col("_row_num") == 1)
+            .drop("_row_num")
+        )
+        
+        if debug:
+            print(f"   ✅ Deduplication complete!")
+            print(f"      Result: Latest state per primary key with all column values preserved")
+        
+        return df_merged
     
     # ============================================================================
     # STANDARD MODE: Merge fragments within events, preserve all CDC events
@@ -1171,60 +1105,17 @@ def merge_column_family_fragments(
     #   2. Preserve ALL CDC events for a key (different timestamps)
     agg_exprs = []
     
-    # Determine which timestamp column to use for grouping
-    timestamp_col = None
-    if '_cdc_timestamp' in all_columns:
-        timestamp_col = '_cdc_timestamp'
-    elif '_cdc_updated' in all_columns:
-        timestamp_col = '_cdc_updated'
-    elif '__crdb__updated' in all_columns:
-        timestamp_col = '__crdb__updated'
-    elif 'updated' in all_columns:
-        timestamp_col = 'updated'
+    # Timestamp and operation columns (required; checked at function entry)
+    timestamp_col = '__crdb__updated'
+    # Group by PK + timestamp + operation to preserve all distinct CDC events
+    # (same key can have UPDATE and DELETE at same timestamp)
+    group_by_cols = primary_key_columns + [timestamp_col, '_cdc_operation']
     
-    # Determine grouping columns
-    if timestamp_col and '_cdc_operation' in all_columns:
-        # Group by PK + timestamp + operation to preserve all distinct CDC events
-        # This is critical: same key can have UPDATE and DELETE at same timestamp!
-        group_by_cols = primary_key_columns + [timestamp_col, '_cdc_operation']
-        
-        # For aggregation, use first() with ignorenulls to combine NULL values from fragments
-        # (Each fragment has data for ONE column family, other families are NULL)
-        for col in data_columns:
+    for col in data_columns:
+        agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
+    for col in metadata_columns:
+        if col in all_columns and col not in group_by_cols:
             agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
-        
-        # Metadata columns: also use first()
-        # Don't aggregate columns that are already in the grouping key
-        for col in metadata_columns:
-            if col in all_columns and col not in group_by_cols:
-                agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
-    elif timestamp_col:
-        # Fallback: Group by PK + timestamp only
-        group_by_cols = primary_key_columns + [timestamp_col]
-        
-        # For aggregation, use first() with ignorenulls to combine NULL values from fragments
-        # (Each fragment has data for ONE column family, other families are NULL)
-        for col in data_columns:
-            agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
-        
-        # Metadata columns: also use first()
-        # Don't aggregate columns that are already in the grouping key
-        for col in metadata_columns:
-            if col in all_columns and col not in group_by_cols:
-                agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
-    else:
-        # No timestamp column - group by PK + operation if available (best effort)
-        if '_cdc_operation' in all_columns:
-            group_by_cols = primary_key_columns + ['_cdc_operation']
-        else:
-            group_by_cols = primary_key_columns
-        
-        for col in data_columns:
-            agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
-        
-        for col in metadata_columns:
-            if col in all_columns and col not in group_by_cols:
-                agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
     
     # Group by primary key + timestamp + operation and aggregate
     if not agg_exprs:
@@ -1276,7 +1167,7 @@ def ingest_cdc_append_only_multi_family(
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
-        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+        resolved_watermark: Optional RESOLVED timestamp as HLC string ("WallTime.Logical"); do not pass int.
                            If provided, uses this watermark (for multi-table coordination).
                            If None, will compute from .RESOLVED files if enabled.
                            CRITICAL for multi-CF: Ensures all fragments are complete.
@@ -1284,8 +1175,9 @@ def ingest_cdc_append_only_multi_family(
     Returns:
         StreamingQuery object
     """
-    # Build paths using helper
-    source_path, checkpoint_path, target_table_fqn = _build_paths(config)
+    # Build paths using helper (checkpoint on target schema, directory name = table name)
+    source_path, checkpoint_path, target_table_fqn = _build_paths(config, spark=spark)
+    _ensure_checkpoint_volume(spark, config.cdc_config.checkpoint_base_path)
     
     # Get primary key columns from config
     primary_key_columns = config.cdc_config.primary_key_columns
@@ -1343,7 +1235,7 @@ def ingest_cdc_append_only_multi_family(
     
     # Merge column family fragments (batch mode - no streaming limitations!)
     print("🔧 Merging column family fragments...")
-    print(f"   Grouping by: {primary_key_columns} + _cdc_timestamp + _cdc_operation")
+    print(f"   Grouping by: {primary_key_columns} + timestamp + _cdc_operation")
     print(f"   Using first(col, ignorenulls=True) to coalesce fragments")
     merged_df = merge_column_family_fragments(staging_df, primary_key_columns)
     print("✅ Column family fragments merged")
@@ -1392,12 +1284,12 @@ def ingest_cdc_with_merge_multi_family(
     Target table will contain:
     - All data columns from source
     - _cdc_operation: "UPSERT" (shows last operation)
-    - _cdc_timestamp: Timestamp of last CDC event
+    - __crdb__updated: HLC timestamp string (e.g. WallTime.Logical); display as-is (full HLC) to avoid confusion
     
     Args:
         config: Config dataclass from cockroachdb_config.py
         spark: SparkSession
-        resolved_watermark: Optional RESOLVED timestamp in nanoseconds.
+        resolved_watermark: Optional RESOLVED timestamp as HLC string ("WallTime.Logical"); do not pass int.
                            If provided, uses this watermark (for multi-table coordination).
                            If None, will compute from .RESOLVED files if enabled.
                            CRITICAL for multi-CF: Ensures all fragments are complete.
@@ -1408,8 +1300,9 @@ def ingest_cdc_with_merge_multi_family(
     from pyspark.sql import functions as F, Window
     from delta.tables import DeltaTable
     
-    # Build paths using helper (with "_merge_cf" suffix for checkpoint)
-    source_path, checkpoint_path, target_table_fqn = _build_paths(config, mode_suffix="_merge_cf")
+    # Build paths using helper (checkpoint on target schema, directory = table name + _merge_cf)
+    source_path, checkpoint_path, target_table_fqn = _build_paths(config, mode_suffix="_merge_cf", spark=spark)
+    _ensure_checkpoint_volume(spark, config.cdc_config.checkpoint_base_path)
     
     # Get primary key columns from config
     primary_key_columns = config.cdc_config.primary_key_columns

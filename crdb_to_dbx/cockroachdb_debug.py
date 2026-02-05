@@ -29,12 +29,12 @@ Available Functions:
 Usage in notebook:
     from cockroachdb_debug import quick_check_missing_keys, inspect_target_table
     
-    # Quick check for missing keys
-    quick_check_missing_keys(conn, spark, source_table, target_catalog, 
-                             target_schema, target_table, [17, 18, 19])
+    # Quick check for missing keys (primary_key_columns from config)
+    quick_check_missing_keys(conn, spark, source_table, target_catalog,
+                             target_schema, target_table, primary_key_columns, [17, 18, 19])
     
-    # Comprehensive target analysis
-    inspect_target_table(spark, target_catalog, target_schema, target_table)
+    # Comprehensive target analysis (primary_key_columns from config)
+    inspect_target_table(spark, target_catalog, target_schema, target_table, primary_key_columns)
     
     # Full diagnosis
     run_full_diagnosis(conn, spark, source_table, target_df, staging_table,
@@ -152,9 +152,12 @@ def find_mismatched_rows(
         is_append_only: If True, deduplicates target to latest state before comparison
     
     Returns:
-        True if mismatches were found, False otherwise
+        Tuple of (has_mismatch: bool, target_extra_keys_count: int, target_extra_keys_list: list).
+        target_extra_keys_count/list are set when target has rows that were deleted in source (update_delete mode only).
     """
     from pyspark.sql import functions as F
+    
+    missing_source_count = 0  # keys in target but not in source (target-extra rows)
     
     print("=" * 80)
     print("DETAILED MISMATCH ANALYSIS (Row-by-Row)")
@@ -191,7 +194,7 @@ def find_mismatched_rows(
     # Get column names from first row (if any)
     if not source_rows:
         print(f"   ⚠️  Source table is empty!")
-        return
+        return False, 0, []
     
     # Build schema from target for just the columns we selected
     from pyspark.sql.types import StructType
@@ -204,19 +207,16 @@ def find_mismatched_rows(
     # Filter target to same columns
     target_df_filtered = target_df.select(*target_columns)
     
-    # For append_only mode, deduplicate to latest state per key
+    # For append_only mode, deduplicate to latest state per key (requires __crdb__updated)
     if is_append_only:
-        # Check if we have timestamp column for deduplication
-        if '_cdc_timestamp' in target_df.columns or '__crdb__updated' in target_df.columns:
-            # Use reusable deduplication function
-            from cockroachdb_ycsb import deduplicate_to_latest
-            
-            target_df_latest = deduplicate_to_latest(target_df, primary_keys, verbose=True)
-            
-            # Re-filter to business columns only
-            target_df_filtered = target_df_latest.select(*target_columns)
-        else:
-            print(f"   ⚠️  No timestamp column found - comparing all rows directly")
+        if '__crdb__updated' not in target_df.columns:
+            raise ValueError(
+                "Target table is missing __crdb__updated. Append-only comparison requires the connector "
+                "timestamp column for deduplication. Ensure the target was written by the connector."
+            )
+        from cockroachdb_ycsb import deduplicate_to_latest
+        target_df_latest = deduplicate_to_latest(target_df, primary_keys, verbose=True)
+        target_df_filtered = target_df_latest.select(*target_columns)
     
     source_count = source_df.count()
     target_count = target_df_filtered.count()
@@ -256,6 +256,9 @@ def find_mismatched_rows(
             if is_append_only:
                 print(f"\n   ℹ️  Note: In append_only mode, it's EXPECTED for target to have extra keys.")
                 print(f"   These are likely deleted rows retained in the append-only log.")
+            else:
+                print(f"\n   ❌ In update_delete mode, target must match source exactly.")
+                print(f"   These rows were DELETED in source but still exist in target (MERGE did not apply DELETEs).")
     
     # Check each column for value mismatches
     print(f"\n📊 Checking {len(columns_to_check)} columns for value mismatches...")
@@ -292,21 +295,34 @@ def find_mismatched_rows(
         else:
             print(f"   ✅ {col}: All values match")
     
-    # Determine overall mismatch status
-    has_mismatch = any_mismatch or source_keys_missing
+    # In update_delete mode, target having extra keys (deleted in source) is a sync failure
+    target_extra_keys_sync_failure = (not is_append_only and missing_source_count > 0)
+    has_mismatch = any_mismatch or source_keys_missing or target_extra_keys_sync_failure
     
-    if not any_mismatch and not source_keys_missing:
+    # Collect list of keys in target but not in source (for DELETE investigation)
+    target_extra_keys_list = []
+    if missing_source_count > 0:
+        target_extra_keys_list = [row[primary_keys[0]] for row in missing_in_source.collect()]
+    
+    if not any_mismatch and not source_keys_missing and not target_extra_keys_sync_failure:
         print(f"\n✅ All {len(columns_to_check)} columns match perfectly across all rows!")
         print(f"✅ All source keys exist in target!")
-        return False  # No mismatches found
+        if not is_append_only:
+            print(f"✅ Target has no extra rows (DELETEs applied).")
+        return False, 0, []  # No mismatches found
     elif source_keys_missing:
         print(f"\n❌ CRITICAL: Source keys are missing from target!")
         if any_mismatch:
             print(f"❌ ALSO: Found value mismatches in columns")
-        return True  # Critical mismatch - data loss
+        return True, missing_source_count if not is_append_only else 0, []
+    elif target_extra_keys_sync_failure:
+        print(f"\n❌ SYNC FAILURE: Target has {missing_source_count} rows that were DELETED in source.")
+        if any_mismatch:
+            print(f"❌ ALSO: Found value mismatches in columns")
+        return True, missing_source_count, target_extra_keys_list
     else:
         print(f"\n⚠️  Found value mismatches - see details above")
-        return True  # Mismatches found
+        return True, 0, []
 
 
 def compare_row_by_row(
@@ -337,12 +353,16 @@ def compare_row_by_row(
     except:
         pass
     
+    if cdc_mode == "append_only" and "__crdb__updated" not in target_df.columns:
+        raise ValueError(
+            "Target table is missing __crdb__updated. Append-only row comparison requires it to select the latest row per key."
+        )
     print("=" * 80)
     print("ROW-BY-ROW COMPARISON (Source → Target)")
     print("=" * 80)
     if cdc_mode == "append_only":
         print("\n📝 Mode: APPEND_ONLY")
-        print("   Comparing source against LATEST target row (by timestamp)")
+        print("   Comparing source against LATEST target row (by __crdb__updated)")
     else:
         print("\n📝 Mode: UPDATE_DELETE")
         print("   Comparing source against target (should be 1:1 match)")
@@ -375,13 +395,9 @@ def compare_row_by_row(
         target_filter = " AND ".join(f"{k} == {v}" for k, v in key_values.items())
         target_filtered = target_df.filter(target_filter)
         
-        # For append_only mode, get the LATEST row by timestamp
+        # For append_only mode, get the LATEST row by __crdb__updated (required; checked above)
         if cdc_mode == "append_only":
-            # Check if _cdc_timestamp column exists
-            if "_cdc_timestamp" in target_df.columns:
-                target_filtered = target_filtered.orderBy(F.col("_cdc_timestamp").desc())
-            elif "__crdb__updated" in target_df.columns:
-                target_filtered = target_filtered.orderBy(F.col("__crdb__updated").desc())
+            target_filtered = target_filtered.orderBy(F.col("__crdb__updated").desc())
         
         target_row = target_filtered.select(*columns_to_check).first()
         
@@ -939,6 +955,94 @@ def inspect_raw_cdc_files(
         print(f"❌ Error inspecting raw CDC files: {e}")
 
 
+def investigate_delete_sync(
+    spark,
+    staging_table: str,
+    target_df: DataFrame,
+    primary_keys: List[str],
+    target_extra_keys: List,
+) -> None:
+    """
+    Investigate why rows that were DELETED in source still exist in target (update_delete mode).
+    For each key in target_extra_keys, checks staging table: is there a DELETE event? Is it the latest?
+    Compares with target row to determine why MERGE did not remove the row.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+
+    if not target_extra_keys:
+        return
+
+    print("\n" + "=" * 80)
+    print("🔍 DELETE INVESTIGATION: Why are these rows still in target?")
+    print("=" * 80)
+    print(f"   Keys in target but deleted in source: {target_extra_keys[:20]}{'...' if len(target_extra_keys) > 20 else ''}")
+    print()
+
+    try:
+        staging_df = spark.read.table(staging_table)
+    except Exception as e:
+        print(f"   ⚠️  Could not read staging table {staging_table}: {e}")
+        return
+
+    pk_col = primary_keys[0]
+    # Latest event per key in staging (same dedup logic as MERGE)
+    window_spec = Window.partitionBy(pk_col).orderBy(F.col("__crdb__updated").desc())
+    staging_latest = (staging_df
+        .withColumn("_rn", F.row_number().over(window_spec))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+    # For each extra key: what does staging say (latest op) vs target?
+    target_latest = target_df.select(pk_col, "__crdb__updated", "_cdc_operation")
+    keys_to_show = target_extra_keys[:15]  # Limit output
+
+    print("   Per-key: latest event in STAGING vs row in TARGET")
+    print("-" * 80)
+    for key in keys_to_show:
+        st_row = staging_latest.filter(F.col(pk_col) == key).collect()
+        tg_row = target_latest.filter(F.col(pk_col) == key).collect()
+        st_ops = [r["_cdc_operation"] for r in st_row] if st_row else []
+        st_ts = [r["__crdb__updated"] for r in st_row] if st_row else []
+        tg_ops = [r["_cdc_operation"] for r in tg_row] if tg_row else []
+        tg_ts = [r["__crdb__updated"] for r in tg_row] if tg_row else []
+        if st_row:
+            st_op, st_ts_val = st_ops[0], st_ts[0]
+            if tg_row:
+                tg_op, tg_ts_val = tg_ops[0], tg_ts[0]
+                if st_op == "DELETE":
+                    print(f"   Key {key}: Staging latest = DELETE @ {st_ts_val}")
+                    print(f"            Target has     = {tg_op} @ {tg_ts_val}")
+                    if tg_op == "DELETE":
+                        print(f"            → Target row is a DELETE row; MERGE should have removed it (whenMatchedDelete).")
+                        print(f"              Use whenMatchedDelete *before* whenMatchedUpdate in MERGE so DELETEs are applied first.")
+                    print(f"            → Possible causes: MERGE clause order (put whenMatchedDelete first), run order, or re-run ingestion.")
+                else:
+                    print(f"   Key {key}: Staging latest = {st_op} (not DELETE) @ {st_ts_val}")
+                    print(f"            Target has     = {tg_op} @ {tg_ts_val}")
+                    print(f"            → After dedup, latest event for this key is {st_op}, so MERGE did not delete.")
+                    print(f"              If source deleted this key, the DELETE event may be in a later batch not yet merged.")
+            else:
+                print(f"   Key {key}: Staging latest = {st_op} @ {st_ts_val}; Target: no row (already deleted?)")
+        else:
+            print(f"   Key {key}: NOT in staging → DELETE event never reached staging (watermark filter or stream not yet run).")
+    print("-" * 80)
+
+    # Summary counts: how many of target_extra_keys have DELETE as latest in staging?
+    keys_df = spark.createDataFrame([(k,) for k in target_extra_keys], [pk_col])
+    joined = keys_df.join(staging_latest.select(pk_col, "_cdc_operation"), on=pk_col, how="left")
+    with_delete_latest = joined.filter(F.col("_cdc_operation") == "DELETE").count()
+    not_in_staging = joined.filter(F.col("_cdc_operation").isNull()).count()
+    other_latest = len(target_extra_keys) - with_delete_latest - not_in_staging
+
+    print("\n   Summary (why DELETEs didn't remove these rows):")
+    print(f"   • {with_delete_latest} key(s): Staging has DELETE as latest → MERGE should have deleted (re-run MERGE?)")
+    print(f"   • {not_in_staging} key(s): Key not in staging → DELETE never landed in staging (watermark or stream order)")
+    print(f"   • {other_latest} key(s): Staging has UPSERT as latest → DELETE was overwritten by later event in same batch/dedup")
+    print("=" * 80)
+
+
 # Convenience function to run all diagnostics
 def run_full_diagnosis(
     conn,
@@ -1012,14 +1116,19 @@ def run_full_diagnosis(
     
     # 4. Detailed mismatch analysis (if mismatches were reported)
     actual_mismatch_found = False
+    target_extra_keys_count = 0
     missing_source_keys = []
     data_in_staging = False
     if mismatched_columns:
         print(f"\n")
-        actual_mismatch_found = find_mismatched_rows(
+        actual_mismatch_found, target_extra_keys_count, target_extra_keys_list = find_mismatched_rows(
             conn, spark, source_table, target_df, primary_keys, mismatched_columns, 
             is_append_only=is_append_only
         )
+        
+        # For update_delete: investigate why DELETEs weren't applied (staging vs target)
+        if target_extra_keys_count > 0 and staging_table and not is_append_only:
+            investigate_delete_sync(spark, staging_table, target_df, primary_keys, target_extra_keys_list)
         
         # For append_only mode: Check storage for missing source keys
         storage_label = "Unity Catalog Volume" if storage_type == "uc_volume" else "Azure"
@@ -1078,11 +1187,14 @@ def run_full_diagnosis(
     print("📊 DIAGNOSIS SUMMARY")
     print("=" * 80)
     
-    if actual_mismatch_found:
-        print(f"\n❌ CONFIRMED: Data is OUT OF SYNC")
+    if actual_mismatch_found or target_extra_keys_count > 0:
+        print(f"\n❌ CONFIRMED: Source and target are NOT the same")
         print(f"\n🔍 Found Issues:")
-        print(f"    • {len(mismatched_columns)} columns have mismatched values: {', '.join(mismatched_columns[:5])}")
-        print(f"    • See 'DETAILED MISMATCH ANALYSIS' section above for specific rows and values")
+        if target_extra_keys_count > 0:
+            print(f"    • Target has {target_extra_keys_count} row(s) that were DELETED in source (MERGE did not apply DELETEs)")
+        if actual_mismatch_found and mismatched_columns:
+            print(f"    • {len(mismatched_columns)} columns have mismatched values: {', '.join(mismatched_columns[:5])}")
+            print(f"    • See 'DETAILED MISMATCH ANALYSIS' section above for specific rows and values")
         
         if is_append_only:
             print(f"\n💡 Root Cause (APPEND_ONLY Mode):")
@@ -1132,9 +1244,19 @@ def run_full_diagnosis(
         print(f"    • The data sync is CORRECT in the current state")
         print(f"    • The mismatch was detected earlier (before diagnosis)")
         print(f"    • Running the pipeline again resolved the issue")
-        print(f"\n✅ CONCLUSION: Data is in sync!")
+    
+    # Single clear verdict so it's obvious whether source and target match
+    print("\n" + "=" * 80)
+    if actual_mismatch_found or target_extra_keys_count > 0:
+        reason = []
+        if target_extra_keys_count > 0:
+            reason.append(f"target has {target_extra_keys_count} extra row(s) (DELETEs not applied)")
+        if actual_mismatch_found and mismatched_columns:
+            reason.append("column value mismatch(es)")
+        print(f"SOURCE AND TARGET: DIFFER — {'; '.join(reason)}")
     else:
-        print(f"\n✅ No mismatches detected - data is in sync!")
+        print(f"SOURCE AND TARGET: MATCH")
+    print("=" * 80)
     
     print("\n" + "█" * 80)
     print("✅ DIAGNOSIS COMPLETE")
@@ -1148,7 +1270,8 @@ def quick_check_missing_keys(
     target_catalog: str,
     target_schema: str,
     target_table: str,
-    missing_keys: List[int]
+    primary_key_columns: List[str],
+    missing_keys: List,
 ) -> None:
     """
     Lightweight check to see if specific keys exist in CockroachDB and staging.
@@ -1160,7 +1283,8 @@ def quick_check_missing_keys(
         target_catalog: Target catalog (e.g., 'main')
         target_schema: Target schema (e.g., 'robert_lee_crdb')
         target_table: Target table name
-        missing_keys: List of keys to check (e.g., [17, 18, 19])
+        primary_key_columns: Primary key column names from config (e.g., ['ycsb_key'] or ['region', 'id'])
+        missing_keys: List of keys to check. Single PK: e.g. [17, 18, 19]. Multi-PK: e.g. [(1, 'a'), (2, 'b')].
     """
     target_table_fqn = f"{target_catalog}.{target_schema}.{target_table}"
     staging_table_cf = f"{target_table_fqn}_staging_cf"
@@ -1171,20 +1295,28 @@ def quick_check_missing_keys(
     print()
     
     # Check CockroachDB
+    where_clause = " AND ".join([f"{pk} = %s" for pk in primary_key_columns])
+    query = f"SELECT * FROM {source_table} WHERE {where_clause}"
     print(f"📊 CockroachDB ({source_table}):")
     cursor = conn.cursor()
     for key in missing_keys:
-        cursor.execute(f"SELECT * FROM {source_table} WHERE ycsb_key = %s", (key,))
+        key_vals = (key,) if len(primary_key_columns) == 1 and not isinstance(key, (list, tuple)) else tuple(key)
+        cursor.execute(query, key_vals)
         result = cursor.fetchone()
-        print(f"   Key {key}: {'✅ EXISTS' if result else '❌ NOT FOUND (deleted)'}")
+        print(f"   Key {key_vals}: {'✅ EXISTS' if result else '❌ NOT FOUND (deleted)'}")
     
     # Check Staging Table
     print(f"\n📊 Staging Table ({staging_table_cf}):")
     if spark.catalog.tableExists(staging_table_cf):
         staging_df = spark.read.table(staging_table_cf)
         for key in missing_keys:
-            count = staging_df.filter(F.col("ycsb_key") == key).count()
-            print(f"   Key {key}: {count} row(s)")
+            key_vals = (key,) if len(primary_key_columns) == 1 and not isinstance(key, (list, tuple)) else tuple(key)
+            key_filter = None
+            for pk_col, val in zip(primary_key_columns, key_vals):
+                f = F.col(pk_col) == val
+                key_filter = f if key_filter is None else (key_filter & f)
+            count = staging_df.filter(key_filter).count()
+            print(f"   Key {key_vals}: {count} row(s)")
         
         print("\n💡 Next steps:")
         print("   - If keys exist in CockroachDB but not in staging:")
@@ -1201,7 +1333,8 @@ def inspect_target_table(
     spark,
     target_catalog: str,
     target_schema: str,
-    target_table: str
+    target_table: str,
+    primary_key_columns: List[str],
 ) -> None:
     """
     Comprehensive analysis of target table:
@@ -1217,6 +1350,7 @@ def inspect_target_table(
         target_catalog: Target catalog (e.g., 'main')
         target_schema: Target schema (e.g., 'robert_lee_crdb')
         target_table: Target table name
+        primary_key_columns: Primary key column names from config (e.g., ['ycsb_key'] or ['region', 'id'])
     """
     target_table_fqn = f"{target_catalog}.{target_schema}.{target_table}"
     
@@ -1240,10 +1374,13 @@ def inspect_target_table(
             print("   This is a bug - DELETE rows should not be in the target table.")
             print("   💡 Run Cell 16 to fix (drops and recreates table)")
     
-    # Show key distribution
-    if "ycsb_key" in df.columns:
+    # Show key distribution (use first PK column for single-column stats; all PKs for duplicate check)
+    pk_first = primary_key_columns[0]
+    if pk_first in df.columns:
         print("\n🔍 Key Distribution:")
-        key_dist = df.groupBy("ycsb_key").count().orderBy("ycsb_key")
+        key_dist = df.groupBy(*primary_key_columns).count()
+        if len(primary_key_columns) == 1:
+            key_dist = key_dist.orderBy(pk_first)
         key_dist.show(50)
         
         # Check for duplicates
@@ -1256,32 +1393,33 @@ def inspect_target_table(
         else:
             print("\n✅ No duplicate keys found")
         
-        # Show key range and gaps
-        key_stats = df.select(
-            F.min("ycsb_key").alias("min_key"),
-            F.max("ycsb_key").alias("max_key"),
-            F.count("ycsb_key").alias("count")
-        ).collect()[0]
-        
-        expected_count = key_stats["max_key"] - key_stats["min_key"] + 1
-        actual_count = key_stats["count"]
-        missing_count = expected_count - actual_count
-        
-        print(f"\n📊 Key Range Analysis:")
-        print(f"   Min key: {key_stats['min_key']}")
-        print(f"   Max key: {key_stats['max_key']}")
-        print(f"   Expected rows (if contiguous): {expected_count}")
-        print(f"   Actual rows: {actual_count}")
-        
-        if missing_count > 0:
-            print(f"   ⚠️  Missing {missing_count} keys (gaps in range)")
-            print(f"\n   💡 Run quick_check_missing_keys() or detailed_missing_keys_investigation() to investigate specific keys")
-        else:
-            print(f"   ✅ No gaps (keys are contiguous)")
+        # Show key range and gaps (only for single numeric PK)
+        if len(primary_key_columns) == 1:
+            key_stats = df.select(
+                F.min(pk_first).alias("min_key"),
+                F.max(pk_first).alias("max_key"),
+                F.count(pk_first).alias("count")
+            ).collect()[0]
+            
+            expected_count = key_stats["max_key"] - key_stats["min_key"] + 1 if (key_stats["min_key"] is not None and key_stats["max_key"] is not None) else 0
+            actual_count = key_stats["count"] or 0
+            missing_count = expected_count - actual_count if expected_count > 0 else 0
+            
+            print(f"\n📊 Key Range Analysis:")
+            print(f"   Min key: {key_stats['min_key']}")
+            print(f"   Max key: {key_stats['max_key']}")
+            print(f"   Expected rows (if contiguous): {expected_count}")
+            print(f"   Actual rows: {actual_count}")
+            
+            if missing_count > 0:
+                print(f"   ⚠️  Missing {missing_count} keys (gaps in range)")
+                print(f"\n   💡 Run quick_check_missing_keys() or detailed_missing_keys_investigation() to investigate specific keys")
+            else:
+                print(f"   ✅ No gaps (keys are contiguous)")
     
-    # Show sample records
+    # Show sample records (order by primary key columns)
     print("\n🔍 Sample Records (ordered by key)::")
-    df.orderBy("ycsb_key").show(30, truncate=False)
+    df.orderBy(*primary_key_columns).show(30, truncate=False)
     
     print("\n" + "=" * 80)
     print("💡 If you see issues:")
@@ -1411,6 +1549,11 @@ def run_full_diagnosis_from_config(
     # Refresh target DataFrame
     print("📊 Refreshing target DataFrame...")
     target_df = spark.read.table(target_table_fqn)
+    if '__crdb__updated' not in target_df.columns:
+        raise ValueError(
+            "Target table is missing __crdb__updated. Diagnosis requires this column. "
+            "Ensure the target was written by the connector pipeline that keeps __crdb__updated."
+        )
     total_rows = target_df.count()
     print(f"✅ Target DataFrame refreshed: {total_rows:,} rows\n")
     
@@ -1437,12 +1580,8 @@ def run_full_diagnosis_from_config(
         ops_df.show()
         
         print("\n📋 Sample rows (showing first 5):")
-        target_df.select(
-            "ycsb_key", 
-            "field0", 
-            "_cdc_operation", 
-            "_cdc_timestamp"
-        ).orderBy("_cdc_timestamp").show(5, truncate=False)
+        sample_cols = [c for c in list(primary_keys) + ["field0", "_cdc_operation", "__crdb__updated"] if c in target_df.columns]
+        target_df.select(*sample_cols).orderBy(F.col("__crdb__updated").desc()).show(5, truncate=False)
     
     if cdc_mode_config == "append_only":
         print("\n📊 Mode: APPEND_ONLY")
@@ -1493,12 +1632,13 @@ def run_full_diagnosis_from_config(
         # Get source table stats
         source_table_fqn = f"{source_catalog}.{source_schema}.{source_table}"
         source_stats = get_table_stats(conn, source_table_fqn)
-        source_sum = get_column_sum(conn, source_table_fqn, 'ycsb_key')
+        pk_first = primary_keys[0]
+        source_sum = get_column_sum(conn, source_table_fqn, pk_first)
         
         # Get raw target stats first (before any processing)
         raw_target_stats_row = target_df.agg(
-            F.min("ycsb_key").alias("min_key"),
-            F.max("ycsb_key").alias("max_key"),
+            F.min(pk_first).alias("min_key"),
+            F.max(pk_first).alias("max_key"),
             F.count("*").alias("count")
         ).collect()[0]
         raw_target_stats = {
@@ -1506,7 +1646,7 @@ def run_full_diagnosis_from_config(
             'max_key': raw_target_stats_row['max_key'],
             'count': raw_target_stats_row['count'],
         }
-        raw_target_sum = get_column_sum_spark(target_df, 'ycsb_key')
+        raw_target_sum = get_column_sum_spark(target_df, pk_first)
         
         # Prepare target DataFrame (deduplicate if append_only)
         target_df_for_comparison = target_df
@@ -1521,14 +1661,15 @@ def run_full_diagnosis_from_config(
             # For append_only, filter target to only keys that exist in source
             # This allows fair comparison (source may have deleted rows)
             print(f"\n   Step 2: Filtering to source keys only for comparison...")
-            source_keys_query = f"SELECT ycsb_key FROM {source_table_fqn}"
+            source_keys_query = f"SELECT {', '.join(primary_keys)} FROM {source_table_fqn}"
             source_keys_result = conn.run(source_keys_query)
             conn.commit()  # Close read transaction
-            source_keys = [row[0] for row in source_keys_result]
-            
-            target_df_for_comparison = target_df_deduplicated.filter(
-                F.col("ycsb_key").isin(source_keys)
+            # Join target to source keys (works for single or multi-column PK)
+            from pyspark.sql import Row
+            source_keys_df = spark.createDataFrame(
+                [Row(**dict(zip(primary_keys, row))) for row in source_keys_result]
             )
+            target_df_for_comparison = target_df_deduplicated.join(source_keys_df, primary_keys, "inner")
             filtered_count = target_df_for_comparison.count()
             print(f"   ✅ Filtered: {deduplicated_count} rows → {filtered_count} rows (matching source keys)")
             
@@ -1539,8 +1680,8 @@ def run_full_diagnosis_from_config(
         
         # Get target stats from processed DataFrame
         stats_row = target_df_for_comparison.agg(
-            F.min("ycsb_key").alias("min_key"),
-            F.max("ycsb_key").alias("max_key"),
+            F.min(pk_first).alias("min_key"),
+            F.max(pk_first).alias("max_key"),
             F.count("*").alias("count")
         ).collect()[0]
         target_stats = {
@@ -1549,14 +1690,14 @@ def run_full_diagnosis_from_config(
             'count': stats_row['count'],
             'is_empty': stats_row['min_key'] is None and stats_row['max_key'] is None
         }
-        target_sum = get_column_sum_spark(target_df_for_comparison, 'ycsb_key')
+        target_sum = get_column_sum_spark(target_df_for_comparison, pk_first)
         
         # Display comparison
         print(f"📊 Source Table (CockroachDB): {source_table_fqn}")
         print(f"   Min key: {source_stats['min_key']}")
         print(f"   Max key: {source_stats['max_key']}")
         print(f"   Count:   {source_stats['count']}")
-        print(f"   Sum (ycsb_key): {source_sum}")
+        print(f"   Sum ({pk_first}): {source_sum}")
         
         if cdc_mode_config == "append_only":
             # Show both raw and processed target stats for append_only mode
@@ -1564,7 +1705,7 @@ def run_full_diagnosis_from_config(
             print(f"   Min key: {raw_target_stats['min_key']}")
             print(f"   Max key: {raw_target_stats['max_key']}")
             print(f"   Count:   {raw_target_stats['count']}")
-            print(f"   Sum (ycsb_key): {raw_target_sum}")
+            print(f"   Sum ({pk_first}): {raw_target_sum}")
             print(f"   Note: This includes ALL CDC events (multiple versions of same key)")
             
             print(f"\n📊 Target Table (Databricks Delta) - FOR COMPARISON: {target_table_fqn}")
@@ -1572,14 +1713,14 @@ def run_full_diagnosis_from_config(
             print(f"   Min key: {target_stats['min_key']}")
             print(f"   Max key: {target_stats['max_key']}")
             print(f"   Count:   {target_stats['count']}")
-            print(f"   Sum (ycsb_key): {target_sum}")
+            print(f"   Sum ({pk_first}): {target_sum}")
             print(f"   Note: This should match source (apples-to-apples comparison)")
         else:
             print(f"\n📊 Target Table (Databricks Delta): {target_table_fqn}")
             print(f"   Min key: {target_stats['min_key']}")
             print(f"   Max key: {target_stats['max_key']}")
             print(f"   Count:   {target_stats['count']}")
-            print(f"   Sum (ycsb_key): {target_sum}")
+            print(f"   Sum ({pk_first}): {target_sum}")
         
         # Compare all columns
         print("\n📊 Column Sums Comparison (All Fields):")
@@ -1589,8 +1730,9 @@ def run_full_diagnosis_from_config(
             print("   Note: Target may have extra deleted rows - only comparing matching keys")
         print()
         
-        columns_to_verify = ['ycsb_key', 'field0', 'field1', 'field2', 'field3',
-                             'field4', 'field5', 'field6', 'field7', 'field8', 'field9']
+        columns_to_verify = list(primary_keys) + [c for c in
+            ['field0', 'field1', 'field2', 'field3', 'field4', 'field5', 'field6', 'field7', 'field8', 'field9']
+            if c in target_df_for_comparison.columns]
         
         all_columns_match = True
         detected_mismatches = []
@@ -1740,7 +1882,8 @@ def detailed_missing_keys_investigation(
     target_catalog: str,
     target_schema: str,
     target_table: str,
-    missing_keys: List[int]
+    primary_key_columns: List[str],
+    missing_keys: List,
 ) -> None:
     """
     Detailed investigation of missing keys:
@@ -1756,7 +1899,8 @@ def detailed_missing_keys_investigation(
         target_catalog: Target catalog (e.g., 'main')
         target_schema: Target schema (e.g., 'robert_lee_crdb')
         target_table: Target table name
-        missing_keys: List of keys to investigate (e.g., [17, 18, 19])
+        primary_key_columns: Primary key column names from config (e.g., ['ycsb_key'] or ['region', 'id'])
+        missing_keys: List of keys to investigate. For single PK: e.g. [17, 18, 19]. For multi-PK: e.g. [(1, 'a'), (2, 'b')].
     """
     target_table_fqn = f"{target_catalog}.{target_schema}.{target_table}"
     staging_table_cf = f"{target_table_fqn}_staging_cf"
@@ -1771,17 +1915,20 @@ def detailed_missing_keys_investigation(
     print("-" * 80)
     
     cursor = conn.cursor()
+    where_clause = " AND ".join([f"{pk} = %s" for pk in primary_key_columns])
+    query = f"SELECT * FROM {source_table} WHERE {where_clause}"
     
     for key in missing_keys:
-        cursor.execute(f"SELECT * FROM {source_table} WHERE ycsb_key = %s", (key,))
+        key_vals = (key,) if len(primary_key_columns) == 1 and not isinstance(key, (list, tuple)) else tuple(key)
+        cursor.execute(query, key_vals)
         result = cursor.fetchone()
         
         if result:
-            print(f"✅ Key {key}: EXISTS in CockroachDB")
+            print(f"✅ Key {key_vals}: EXISTS in CockroachDB")
             # Show first 3 fields for verification
             print(f"   Sample data: {result[:min(3, len(result))]}")
         else:
-            print(f"❌ Key {key}: NOT FOUND in CockroachDB")
+            print(f"❌ Key {key_vals}: NOT FOUND in CockroachDB")
             print(f"   → This key was deleted (expected for update_delete mode)")
     
     # Step 2: Check Staging Table
@@ -1794,21 +1941,21 @@ def detailed_missing_keys_investigation(
         print()
         
         for key in missing_keys:
-            key_rows = staging_df.filter(F.col("ycsb_key") == key)
+            key_vals = (key,) if len(primary_key_columns) == 1 and not isinstance(key, (list, tuple)) else tuple(key)
+            key_filter = None
+            for pk_col, val in zip(primary_key_columns, key_vals):
+                f = F.col(pk_col) == val
+                key_filter = f if key_filter is None else (key_filter & f)
+            key_rows = staging_df.filter(key_filter)
             count = key_rows.count()
             
             if count > 0:
-                print(f"✅ Key {key}: {count} row(s) in staging table")
+                print(f"✅ Key {key_vals}: {count} row(s) in staging table")
                 print("   Details:")
-                key_rows.select(
-                    "ycsb_key", 
-                    "_cdc_timestamp", 
-                    "_cdc_operation", 
-                    "field0", 
-                    "field1"
-                ).show(truncate=False)
+                detail_cols = [c for c in list(primary_key_columns) + ["__crdb__updated", "_cdc_operation", "field0", "field1"] if c in key_rows.columns]
+                key_rows.select(*detail_cols).show(truncate=False)
             else:
-                print(f"❌ Key {key}: NOT in staging table")
+                print(f"❌ Key {key_vals}: NOT in staging table")
         
         # Show staging table summary
         print("\n📈 Staging Table Summary:")
