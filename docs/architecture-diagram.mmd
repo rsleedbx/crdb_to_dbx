@@ -1,4 +1,4 @@
-flowchart TD
+flowchart LR
     A["<b>CockroachDB Cluster</b><br/><br/>CREATE CHANGEFEED FOR TABLE ...<br/>INTO 'azure://...'<br/>WITH format='parquet', resolved"]
     B["<b>Azure Blob Storage (ADLS Gen2)</b><br/><br/>changefeed-events/<br/>  └─ parquet/<br/>    └─ catalog/schema/table/<br/>      ├─ data.parquet<br/>      └─ .RESOLVED"]
     C["<b>Unity Catalog</b><br/><br/>Access Control Options:<br/>• External Locations (direct)<br/>• External Volumes (governed)<br/><br/>Security & Governance Layer"]
