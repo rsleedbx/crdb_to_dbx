@@ -20,7 +20,7 @@ CockroachDB changefeeds natively generate snapshot and CDC records in Parquet fo
 - ✅ **Schema evolution** (automatic schema inference and merging)
 - ✅ **Multiple CockroachDB changefeed formats to blob storage** (Parquet, JSON, Avro, CSV)
 
-This guide focuses on **Parquet format** for native Delta Lake integration. Parquet is CockroachDB's recommended format for cloud storage changefeeds.
+This guide focuses on **Parquet format** for native Delta Lake integration. 
 
 ---
 
@@ -39,7 +39,7 @@ CREATE TABLE usertable (
 
 ### Step 2. Create a changefeed *(CockroachDB → Azure)*
 
-Stream changes to Azure Blob Storage as Parquet files:
+Stream changes to Azure Blob Storage as Parquet files. (Schema file generation is not shown here for clarity; the tutorial notebook writes it during prep via `ensure_schema_in_storage`. For the YCSB example, the schema file must exist at the path and with content described below so the autoloader can resolve primary keys without the source database. To remove the need for an external schema file, primary key metadata could be embedded in the Parquet files; see [CockroachDB issue #161963](https://github.com/cockroachdb/cockroach/issues/161963) to request this.)
 
 ```sql
 CREATE CHANGEFEED FOR TABLE usertable
@@ -61,6 +61,36 @@ changefeed-events/parquet/defaultdb/public/usertable/usertable_cdc/
   └── ...
 ```
 
+**Step 2b. Schema file (optional for append-only).** For **append-only** mode you can skip this step. For update/delete MERGE and multi–column-family merge, the autoloader must read primary keys from a schema file in the same container. Every CockroachDB table has a primary key—if you do not define one, [CockroachDB adds a hidden one automatically](https://www.cockroachlabs.com/docs/stable/schema-design-table#primary-key-best-practices). When required, place the schema file at:
+
+`changefeed-events/parquet/defaultdb/public/usertable/_metadata/schema.json`
+
+Example content for the YCSB `usertable` (one primary key, 11 columns). The `type` values come from CockroachDB `information_schema.columns` (e.g. `integer`, `text`) and may vary:
+
+```json
+{
+  "table_name": "usertable",
+  "catalog": "defaultdb",
+  "schema": "public",
+  "primary_keys": ["ycsb_key"],
+  "columns": [
+    {"name": "ycsb_key", "type": "integer", "nullable": false},
+    {"name": "field0", "type": "text", "nullable": true},
+    {"name": "field1", "type": "text", "nullable": true},
+    {"name": "field2", "type": "text", "nullable": true},
+    {"name": "field3", "type": "text", "nullable": true},
+    {"name": "field4", "type": "text", "nullable": true},
+    {"name": "field5", "type": "text", "nullable": true},
+    {"name": "field6", "type": "text", "nullable": true},
+    {"name": "field7", "type": "text", "nullable": true},
+    {"name": "field8", "type": "text", "nullable": true},
+    {"name": "field9", "type": "text", "nullable": true}
+  ]
+}
+```
+
+The tutorial notebook writes this file during the prep step (with CockroachDB connection); ingestion then runs without source credentials.
+
 ### Step 3. Insert data *(CockroachDB)*
 
 ```sql
@@ -74,7 +104,7 @@ The CockroachDB changefeed automatically captures these changes and writes them 
 
 ### Step 4. Configure Unity Catalog access to Azure *(Databricks)*
 
-Create an External Volume for governed, credential-free access to your Azure storage:
+Create an External Volume for Unity Catalog governed access to your Azure storage:
 
 ```sql
 -- 1. Create storage credential (one-time setup)
@@ -153,7 +183,7 @@ ORDER BY __crdb__updated;
 
 ### Want more CDC capabilities?
 
-The complete working notebook (`sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`) includes examples for both CDC modes with standard tables and CockroachDB column families:
+The complete working notebook (`crdb_to_dbx/cockroachdb-cdc-tutorial.ipynb`) includes examples for both CDC modes with standard tables and CockroachDB column families:
 
 | CDC Mode | Target Behavior | Use Case | Column Family Examples |
 |----------|-----------------|----------|----------------------|
@@ -177,7 +207,7 @@ CockroachDB [column families](https://www.cockroachlabs.com/docs/stable/column-f
 
 ## Architecture
 
-![CDC Architecture Diagram](mermaid-diagram-2026-02-04-193854.png)
+![CDC Architecture Diagram](mermaid-diagram-2026-02-05-171357.png)
 
 *The data flow from CockroachDB through Azure Blob Storage and Unity Catalog to Delta Lake using Databricks Auto Loader. 
 
@@ -263,8 +293,10 @@ df_merged.writeStream.toTable(target_table)
 from crdb_to_dbx.cockroachdb_config import load_and_process_config
 from crdb_to_dbx import ingest_cdc_with_merge_multi_family
 
-config = load_and_process_config("config.json")
-query = ingest_cdc_with_merge_multi_family(config=config, spark=spark)
+config = load_and_process_config("config.json", spark=spark)
+result = ingest_cdc_with_merge_multi_family(config=config, spark=spark)
+# result is a dict: query, staging_table, target_table, raw_count, deduped_count, merged
+result["query"].awaitTermination()  # optional: wait for stream
 ```
 
 The `merge_column_family_fragments` function groups by primary key and timestamp, then coalesces NULL values across fragments using PySpark aggregations.
@@ -293,15 +325,12 @@ from crdb_to_dbx import ingest_cdc_with_merge_multi_family
 # WITH format='parquet', updated, resolved='10s';
 
 # Auto Loader with RESOLVED watermarking (default)
-result = ingest_cdc_with_merge_multi_family(
-    config=config,
-    spark=spark
-)
-# Automatically uses latest RESOLVED timestamp for filtering
+result = ingest_cdc_with_merge_multi_family(config=config, spark=spark)
+# result["query"] is the streaming query; automatically uses latest RESOLVED timestamp for filtering
 ```
 
 **What happens:**
-1. Scans Azure for `.RESOLVED` files (CockroachDB format: 33 digits = 14 datetime + 9 nanos + 10 logical; any other format raises).
+1. Scans Azure for `.RESOLVED` files (CockroachDB format: 33 digits = 14 datetime + 9 nanos + 10 logical).
 2. Converts the latest RESOLVED filename to full HLC string (`"WallTime.Logical"`) to match `__crdb__updated`.
 3. Filters CDC events: `__crdb__updated <= watermark` (full HLC string comparison).
 4. Guarantees all column family fragments are complete.
@@ -311,6 +340,12 @@ result = ingest_cdc_with_merge_multi_family(
 ## Testing and validation
 
 In test we validate that source (CockroachDB) and target (Databricks Delta) are exactly the same: we compute a full sum over numeric and character columns across all rows and compare source vs target, and we perform row-by-row value checks (e.g. after deduplicating the target to latest-per-key). The tutorial notebook includes this verification so you can confirm CDC correctness end-to-end.
+
+---
+
+## Security
+
+The ingestion pipeline is designed so that **the autoloader and streaming job do not need CockroachDB or Azure credentials**. Schema and Parquet files are read from storage (Azure Blob or Unity Catalog Volume over the same storage). Primary keys are resolved from the persisted schema file (`_metadata/schema.json`), so the backend that runs the autoloader does not need access to the source database. Only the notebook or job that *starts* the changefeed and sets up the External Location / External Volume needs database and Azure credentials.
 
 ---
 

@@ -11,6 +11,7 @@ Functions:
     - get_existing_changefeeds() - Find existing changefeeds
     - cancel_changefeeds() - Cancel changefeeds
     - drop_table() - Drop a table
+    - get_table_schema() - Extract table schema (primary keys, columns) from CockroachDB
 
 Usage:
     from cockroachdb_sql import create_changefeed_from_config
@@ -27,6 +28,7 @@ Usage:
         print(f"Changefeed already exists: {result['existing_count']}")
 """
 
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 
@@ -431,6 +433,93 @@ def drop_table(conn, table_name: str, cascade: bool = True, verbose: bool = True
     
     if verbose:
         print(f"✅ Dropped table '{table_name}'")
+
+
+def get_table_schema(
+    conn,
+    catalog: str,
+    schema: str,
+    table_name: str,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Extract complete table schema from CockroachDB (primary keys, columns, metadata).
+
+    Queries information_schema and SHOW CREATE TABLE. Use this to populate
+    primary_key_columns for config or to write a schema file to blob/volume.
+
+    Args:
+        conn: pg8000 connection (must be connected to the database equal to catalog)
+        catalog: Database/catalog name (e.g. 'defaultdb'); used in returned dict for storage paths
+        schema: Schema name (e.g. 'public')
+        table_name: Table name
+        verbose: If True, print a short summary (default: True)
+
+    Returns:
+        Dict with: table_name, catalog, schema, primary_keys, columns (list of {name, type, nullable}),
+        create_statement, has_column_families, schema_version, created_at.
+
+    Raises:
+        ValueError: If table has no primary key.
+
+    Example:
+        >>> schema_info = get_table_schema(conn, 'defaultdb', 'public', 'usertable')
+        >>> primary_keys = schema_info['primary_keys']
+        >>> # Write to Azure: write_schema_to_azure(..., schema_info=schema_info)
+    """
+    with conn.cursor() as cur:
+        # SHOW CREATE TABLE: use schema.table (conn is already in catalog/database)
+        target = f"{schema}.{table_name}" if schema != "public" else table_name
+        cur.execute(f"SHOW CREATE TABLE {target}")
+        row = cur.fetchone()
+        create_statement = row[1] if row else ""
+
+        # Primary keys (ordered by ordinal_position)
+        pk_query = """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+              AND tc.table_name = kcu.table_name
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+              AND tc.table_schema = %s
+              AND tc.table_name = %s
+            ORDER BY kcu.ordinal_position
+        """
+        cur.execute(pk_query, (schema, table_name))
+        primary_keys = [r[0] for r in cur.fetchall()]
+        if not primary_keys:
+            raise ValueError(f"Table '{schema}.{table_name}' has no primary key.")
+
+        # Columns
+        col_query = """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+        """
+        cur.execute(col_query, (schema, table_name))
+        columns = [
+            {"name": r[0], "type": r[1], "nullable": r[2] == "YES"}
+            for r in cur.fetchall()
+        ]
+
+    has_column_families = create_statement.upper().count("FAMILY ") > 1
+    schema_info = {
+        "table_name": table_name,
+        "catalog": catalog,
+        "schema": schema,
+        "primary_keys": primary_keys,
+        "columns": columns,
+        "create_statement": create_statement,
+        "has_column_families": has_column_families,
+        "schema_version": 1,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    if verbose:
+        print(f"✅ Schema for {catalog}.{schema}.{table_name}: {len(primary_keys)} PK(s), {len(columns)} columns")
+    return schema_info
 
 
 def show_all_changefeeds(conn, verbose: bool = True) -> List[Tuple]:

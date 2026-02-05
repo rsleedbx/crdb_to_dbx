@@ -22,8 +22,103 @@ Example:
     from cockroachdb_s3 import check_s3_files, wait_for_changefeed_files
 """
 
+import json
 import time
 from typing import Dict, Any, List, Optional
+
+
+def _schema_volume_path(
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    format_type: str = "parquet",
+) -> str:
+    """Relative path for schema file (same as Azure): format/catalog/schema/table/_metadata/schema.json"""
+    return f"{format_type}/{source_catalog}/{source_schema}/{source_table}/_metadata/schema.json"
+
+
+def load_schema_from_uc_volume(
+    volume_path: str,
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    spark,
+    format_type: str = "parquet",
+) -> Optional[Dict[str, Any]]:
+    """
+    Load schema file from Unity Catalog Volume (e.g. to get primary_key_columns for config).
+
+    Tries (1) single file: {volume_path}/{format}/{catalog}/{schema}/{table}/_metadata/schema.json
+    then (2) directory written by write_schema_to_uc_volume: .../_metadata/schema/ (reads first part file).
+    Same path convention as Azure (load_schema_from_azure) so schema can be shared across backends.
+
+    Args:
+        volume_path: Unity Catalog Volume path (e.g. /Volumes/catalog/schema/volume)
+        source_catalog: CockroachDB catalog (e.g. 'defaultdb')
+        source_schema: CockroachDB schema (e.g. 'public')
+        source_table: Source table name
+        spark: SparkSession (required for Volume access)
+        format_type: 'parquet' or 'json' (default: 'parquet')
+
+    Returns:
+        Schema dict (primary_keys, columns, ...) or None if file not found.
+    """
+    base = f"{volume_path.rstrip('/')}/{format_type}/{source_catalog}/{source_schema}/{source_table}/_metadata"
+    single_file = f"{base}/schema.json"
+    dir_written_by_spark = f"{base}/schema"
+    for path in (single_file, dir_written_by_spark):
+        try:
+            # Use spark.read.text (Spark Connect compatible); wholeTextFiles uses sparkContext.
+            df = spark.read.text(path)
+            rows = df.collect()
+            if not rows:
+                continue
+            content = "\n".join(row.value for row in rows)
+            return json.loads(content)
+        except Exception:
+            continue
+    return None
+
+
+def write_schema_to_uc_volume(
+    volume_path: str,
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    schema_info: Dict[str, Any],
+    spark,
+    format_type: str = "parquet",
+    verbose: bool = True,
+) -> str:
+    """
+    Store schema file in Unity Catalog Volume (primary keys, columns, create_statement, etc.).
+
+    Schema is stored at: {volume_path}/{format}/{catalog}/{schema}/{table}/_metadata/schema.json
+    Uses Spark to write a single JSON file so it can be read by load_schema_from_uc_volume.
+
+    Args:
+        volume_path: Unity Catalog Volume path (e.g. /Volumes/catalog/schema/volume)
+        source_catalog: CockroachDB catalog (e.g. 'defaultdb')
+        source_schema: CockroachDB schema (e.g. 'public')
+        source_table: Source table name
+        schema_info: Dict from cockroachdb_sql.get_table_schema() (primary_keys, columns, ...)
+        spark: SparkSession
+        format_type: 'parquet' or 'json' (default: 'parquet')
+        verbose: If True, print the path written (default: True)
+
+    Returns:
+        The full path written (e.g. .../parquet/defaultdb/public/usertable/_metadata/schema.json).
+    """
+    rel = _schema_volume_path(source_catalog, source_schema, source_table, format_type)
+    base = f"{volume_path.rstrip('/')}/{format_type}/{source_catalog}/{source_schema}/{source_table}/_metadata"
+    # Write single file: use DataFrame so Spark Connect is supported (no sparkContext).
+    # Directory "schema" with part-* file(s); load_schema_from_uc_volume reads it via spark.read.text().
+    output_dir = f"{base}/schema"
+    content = json.dumps(schema_info, indent=2)
+    spark.createDataFrame([(content,)], ["value"]).coalesce(1).write.mode("overwrite").text(output_dir)
+    if verbose:
+        print(f"✅ Schema written to UC Volume: {output_dir} (part-* file)")
+    return output_dir
 
 
 def check_volume_files(
