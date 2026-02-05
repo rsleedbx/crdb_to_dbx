@@ -194,6 +194,32 @@ def _print_ingestion_header(config, mode, column_family_mode, source_path, targe
     print()
 
 
+def _resolve_primary_key_columns(config, spark) -> List[str]:
+    """
+    Resolve primary key columns from config or from schema in storage (Azure or UC Volume).
+    Allows the autoloader/ingestion to run without source (CockroachDB) credentials once
+    the schema file has been written to storage by prep code.
+
+    Returns:
+        List of primary key column names.
+
+    Raises:
+        ValueError: If primary_key_columns are not in config and no schema file exists in storage.
+                     Call ensure_schema_in_storage(config, spark, conn) during prep first.
+    """
+    if config.cdc_config.primary_key_columns:
+        return config.cdc_config.primary_key_columns
+    from cockroachdb_storage import load_schema
+    schema_info = load_schema(config, spark=spark)
+    if schema_info and schema_info.get("primary_keys"):
+        return schema_info["primary_keys"]
+    raise ValueError(
+        "primary_key_columns not in config and no schema file in storage. "
+        "Run prep with ensure_schema_in_storage(config, spark, conn) before ingestion, "
+        "or set 'primary_key_columns' in cdc_config in your config JSON."
+    )
+
+
 def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[str]:
     """
     Get the latest RESOLVED timestamp watermark from CockroachDB CDC .RESOLVED files.
@@ -743,9 +769,9 @@ def ingest_cdc_with_merge_single_family(
     source_path, checkpoint_path, target_table_fqn = _build_paths(config, mode_suffix="_merge", spark=spark)
     _ensure_checkpoint_volume(spark, config.cdc_config.checkpoint_base_path)
     
-    # Get primary key columns from config
-    primary_key_columns = config.cdc_config.primary_key_columns
-    
+    # Resolve primary key columns from config or from schema in storage (no source conn required)
+    primary_key_columns = _resolve_primary_key_columns(config, spark)
+
     # Print ingestion header
     _print_ingestion_header(config, "update_delete", "single_cf", source_path, target_table_fqn)
     print(f"Primary keys: {primary_key_columns}")
@@ -1179,9 +1205,9 @@ def ingest_cdc_append_only_multi_family(
     source_path, checkpoint_path, target_table_fqn = _build_paths(config, spark=spark)
     _ensure_checkpoint_volume(spark, config.cdc_config.checkpoint_base_path)
     
-    # Get primary key columns from config
-    primary_key_columns = config.cdc_config.primary_key_columns
-    
+    # Resolve primary key columns from config or from schema in storage (no source conn required)
+    primary_key_columns = _resolve_primary_key_columns(config, spark)
+
     # Print ingestion header
     _print_ingestion_header(config, "append_only", "multi_cf", source_path, target_table_fqn)
     print(f"Primary keys: {primary_key_columns}")
@@ -1304,9 +1330,9 @@ def ingest_cdc_with_merge_multi_family(
     source_path, checkpoint_path, target_table_fqn = _build_paths(config, mode_suffix="_merge_cf", spark=spark)
     _ensure_checkpoint_volume(spark, config.cdc_config.checkpoint_base_path)
     
-    # Get primary key columns from config
-    primary_key_columns = config.cdc_config.primary_key_columns
-    
+    # Resolve primary key columns from config or from schema in storage (no source conn required)
+    primary_key_columns = _resolve_primary_key_columns(config, spark)
+
     # Print ingestion header
     _print_ingestion_header(config, "update_delete", "multi_cf", source_path, target_table_fqn)
     print(f"Primary keys: {primary_key_columns}")

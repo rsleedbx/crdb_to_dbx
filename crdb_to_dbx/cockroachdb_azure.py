@@ -1,12 +1,118 @@
 """
 CockroachDB CDC Azure Utilities
 
-This module provides Azure Blob Storage utilities for CockroachDB CDC changefeeds.
+This module provides Azure Blob Storage utilities for CockroachDB CDC changefeeds,
+including schema file read/write for primary key and metadata (see get_table_schema in cockroachdb_sql).
 """
 
+import json
 import time
 from typing import Dict, Any, List, Optional
 from azure.storage.blob import BlobServiceClient
+
+
+def _schema_blob_path(
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    # Parquet changefeed files have no embedded schema or primary-key metadata (unlike JSON etc.),
+    # so we persist schema to this path; autoloader reads it to resolve primary keys without source DB.
+    format_type: str = "parquet",
+) -> str:
+    """Build blob path for schema file: format/catalog/schema/table/_metadata/schema.json"""
+    return f"{format_type}/{source_catalog}/{source_schema}/{source_table}/_metadata/schema.json"
+
+
+def write_schema_to_azure(
+    storage_account_name: str,
+    storage_account_key: str,
+    container_name: str,
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    schema_info: Dict[str, Any],
+    format_type: str = "parquet",
+    verbose: bool = True,
+) -> str:
+    """
+    Store schema file in Azure Blob Storage (primary keys, columns, create_statement, etc.).
+
+    Schema is stored at: {format}/{catalog}/{schema}/{table}/_metadata/schema.json
+    so it can be read later to get primary_key_columns without hardcoding in config.
+
+    Args:
+        storage_account_name: Azure storage account name
+        storage_account_key: Azure storage account key
+        container_name: Azure container name
+        source_catalog: CockroachDB catalog/database (e.g. 'defaultdb')
+        source_schema: CockroachDB schema (e.g. 'public')
+        source_table: Source table name
+        schema_info: Dict from cockroachdb_sql.get_table_schema() (primary_keys, columns, ...)
+        format_type: 'parquet' or 'json' (default: 'parquet') – determines path prefix
+        verbose: If True, print the blob path (default: True)
+
+    Returns:
+        The blob path written (e.g. parquet/defaultdb/public/usertable/_metadata/schema.json).
+
+    Example:
+        >>> from cockroachdb_sql import get_table_schema
+        >>> from cockroachdb_azure import write_schema_to_azure
+        >>> schema_info = get_table_schema(conn, 'defaultdb', 'public', 'usertable')
+        >>> write_schema_to_azure(account_name, account_key, container, 'defaultdb', 'public', 'usertable', schema_info)
+    """
+    blob_name = _schema_blob_path(source_catalog, source_schema, source_table, format_type)
+    connection_string = (
+        f"DefaultEndpointsProtocol=https;AccountName={storage_account_name};"
+        f"AccountKey={storage_account_key};EndpointSuffix=core.windows.net"
+    )
+    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+    schema_json = json.dumps(schema_info, indent=2)
+    blob_client.upload_blob(schema_json, overwrite=True)
+    if verbose:
+        print(f"✅ Schema written to Azure: {container_name}/{blob_name}")
+    return blob_name
+
+
+def load_schema_from_azure(
+    storage_account_name: str,
+    storage_account_key: str,
+    container_name: str,
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    format_type: str = "parquet",
+) -> Optional[Dict[str, Any]]:
+    """
+    Load schema file from Azure Blob Storage (e.g. to get primary_key_columns for config).
+
+    Path read: {format}/{catalog}/{schema}/{table}/_metadata/schema.json
+
+    Args:
+        storage_account_name: Azure storage account name
+        storage_account_key: Azure storage account key
+        container_name: Azure container name
+        source_catalog: CockroachDB catalog (e.g. 'defaultdb')
+        source_schema: CockroachDB schema (e.g. 'public')
+        source_table: Source table name
+        format_type: 'parquet' or 'json' (default: 'parquet')
+
+    Returns:
+        Schema dict (primary_keys, columns, ...) or None if blob not found.
+    """
+    blob_name = _schema_blob_path(source_catalog, source_schema, source_table, format_type)
+    connection_string = (
+        f"DefaultEndpointsProtocol=https;AccountName={storage_account_name};"
+        f"AccountKey={storage_account_key};EndpointSuffix=core.windows.net"
+    )
+    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+    try:
+        download = blob_client.download_blob()
+        schema_json = download.readall().decode("utf-8")
+        return json.loads(schema_json)
+    except Exception:
+        return None
 
 
 def check_azure_files(

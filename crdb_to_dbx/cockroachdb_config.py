@@ -7,7 +7,7 @@ Extracted from cockroachdb-cdc-tutorial.ipynb cells 1-62.
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import quote
 from typing import Dict, Any, List, Optional
 
@@ -133,7 +133,8 @@ def process_config(config: Dict[str, Any]) -> Config:
 
     cdc_mode = config["cdc_config"]["mode"]
     column_family_mode = config["cdc_config"]["column_family_mode"]
-    primary_key_columns = config["cdc_config"]["primary_key_columns"]
+    # Allow missing or empty primary_key_columns; can be filled from schema later via ensure_primary_key_from_schema()
+    primary_key_columns = config["cdc_config"].get("primary_key_columns") or []
 
     # Auto-suffix table names with mode and column family if enabled
     auto_suffix = config["cdc_config"].get("auto_suffix_mode_family", False)
@@ -252,20 +253,120 @@ def process_config(config: Dict[str, Any]) -> Config:
     return processed_config
 
 
-def load_and_process_config(config_file: str) -> Config:
+def ensure_primary_key_from_schema(config: Config, spark=None) -> Config:
+    """
+    If config.cdc_config.primary_key_columns is empty, try to load from schema in storage (Azure or UC Volume).
+    Use this so the rest of the code can rely on config.cdc_config.primary_key_columns without hardcoding in JSON.
+
+    For uc_external_volume, spark is required. For azure_storage, spark is not used.
+
+    Args:
+        config: Processed Config (e.g. from process_config).
+        spark: SparkSession (required for UC Volume; ignored for Azure).
+
+    Returns:
+        Config unchanged if primary_key_columns already set, or a new Config with primary_key_columns
+        filled from load_schema() if it was empty and schema was found. If empty and schema load fails,
+        returns config unchanged (primary_key_columns still empty).
+    """
+    if config.cdc_config.primary_key_columns:
+        return config
+    # UC Volume requires spark
+    if config.data_source == "uc_external_volume" and not spark:
+        return config
+    try:
+        from cockroachdb_storage import load_schema
+        schema_info = load_schema(config, spark=spark)
+        if schema_info and schema_info.get("primary_keys"):
+            new_cdc = replace(config.cdc_config, primary_key_columns=schema_info["primary_keys"])
+            config = replace(config, cdc_config=new_cdc)
+            print(f"   Primary keys from schema: {schema_info['primary_keys']}")
+        elif schema_info is None and config.data_source == "uc_external_volume":
+            print(f"   ⚠️  No schema file in storage. Write one with: write_schema(config, get_table_schema(conn, ...), spark)")
+    except Exception as e:
+        print(f"   ⚠️  Could not load primary keys from storage: {e}")
+    return config
+
+
+def ensure_primary_key_columns(
+    config: Config,
+    spark=None,
+    conn=None,
+) -> Config:
+    """
+    Ensure config.cdc_config.primary_key_columns is set. Tries (1) schema in storage, (2) CockroachDB via conn.
+    Call this before ingestion when primary_key_columns may be missing from JSON (e.g. notebook or scripts).
+
+    Args:
+        config: Processed Config.
+        spark: SparkSession (required for UC Volume when loading from storage).
+        conn: CockroachDB connection (optional; used if primary_key_columns still empty after storage).
+
+    Returns:
+        Config with primary_key_columns set when possible.
+
+    Raises:
+        ValueError: If primary_key_columns is still empty after trying storage and conn, with a message
+                    explaining how to fix (add to JSON, write schema to storage, or ensure conn is open).
+    """
+    if config.cdc_config.primary_key_columns:
+        return config
+    config = ensure_primary_key_from_schema(config, spark=spark)
+    if config.cdc_config.primary_key_columns:
+        return config
+    if conn is not None:
+        try:
+            from cockroachdb_sql import get_table_schema
+            schema_info = get_table_schema(
+                conn,
+                config.tables.source_catalog,
+                config.tables.source_schema,
+                config.tables.source_table_name,
+                verbose=False,
+            )
+            if schema_info and schema_info.get("primary_keys"):
+                new_cdc = replace(config.cdc_config, primary_key_columns=schema_info["primary_keys"])
+                config = replace(config, cdc_config=new_cdc)
+                print(f"   Primary keys from CockroachDB: {schema_info['primary_keys']}")
+                return config
+        except Exception as e:
+            raise ValueError(
+                "primary_key_columns could not be loaded from CockroachDB. "
+                f"Error: {e}. "
+                "Ensure the connection cell was run and the table exists, or set "
+                "'primary_key_columns' in your config JSON (e.g. [\"ycsb_key\"])."
+            ) from e
+    # Still empty: raise with clear instructions
+    msg = (
+        "primary_key_columns is missing and could not be resolved. "
+        "Either: (1) Add \"primary_key_columns\": [\"<pk_col>\"] to cdc_config in your config JSON, "
+        "(2) Run the connection cell and re-run this cell so we can read from CockroachDB, or "
+        "(3) Write a schema file to storage (write_schema(config, get_table_schema(conn, ...), spark)) and re-run the config cell."
+    )
+    if config.data_source == "uc_external_volume" and not spark:
+        msg += " For UC Volume, spark must be passed so we can try loading from storage."
+    raise ValueError(msg)
+
+
+def load_and_process_config(config_file: str, spark=None) -> Config:
     """
     Load and process configuration in one step.
-    
+    If primary_key_columns is missing or empty in JSON, tries to load it from schema in storage (Azure or UC Volume).
+
     Args:
         config_file: Path to the JSON configuration file.
-    
+        spark: SparkSession (required for UC Volume when using auto primary key; optional otherwise).
+
     Returns:
-        Fully processed configuration as a Config dataclass instance, or None if config cannot be loaded
+        Fully processed configuration as a Config dataclass instance, or None if config cannot be loaded.
+        config.cdc_config.primary_key_columns will be set from JSON or from schema file when possible.
     """
     config = load_config(config_file)
     if config is None:
         return None
-    return process_config(config)
+    config = process_config(config)
+    config = ensure_primary_key_from_schema(config, spark=spark)
+    return config
 
 
 def get_storage_path(config: Config) -> str:

@@ -1,8 +1,8 @@
 flowchart LR
     A["<b>CockroachDB Cluster</b><br/><br/>CREATE CHANGEFEED FOR TABLE ...<br/>INTO 'azure://...'<br/>WITH format='parquet', resolved"]
-    B["<b>Azure Blob Storage (ADLS Gen2)</b><br/><br/>changefeed-events/<br/>  └─ parquet/<br/>    └─ catalog/schema/table/<br/>      ├─ data.parquet<br/>      └─ .RESOLVED"]
+    B["<b>Azure Blob Storage (ADLS Gen2)</b><br/><br/>changefeed-events/<br/>  └─ parquet/<br/>    └─ catalog/schema/table/<br/>      ├─ data.parquet<br/>      ├─ _metadata/schema.json (PK, columns)<br/>      └─ .RESOLVED"]
     C["<b>Unity Catalog</b><br/><br/>Access Control Options:<br/>• External Locations (direct)<br/>• External Volumes (governed)<br/><br/>Security & Governance Layer"]
-    D["<b>Databricks Auto Loader</b><br/><br/>.format('cloudFiles')<br/>.option('cloudFiles.format','parquet')<br/>.load('abfss://...' or '/Volumes/...')<br/><br/>• Automatic file discovery<br/>• Schema inference & evolution<br/>• Exactly-once semantics"]
+    D["<b>Databricks Auto Loader</b><br/><br/>.format('cloudFiles')<br/>.option('cloudFiles.format','parquet')<br/>.load('abfss://...' or '/Volumes/...')<br/><br/>• Primary key read from _metadata/schema.json (no source DB)<br/>• Automatic file discovery<br/>• Schema inference & evolution<br/>• Exactly-once semantics"]
     E["<b>Delta Lake Table</b><br/><br/>• ACID transactions<br/>• Time travel<br/>• Schema evolution<br/>• MERGE support (SCD Type 1)<br/>• Append-only (SCD Type 2)"]
 
     A -->|CDC Events<br/>Parquet| B
