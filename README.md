@@ -1,106 +1,24 @@
 # CockroachDB to Databricks CDC Connector
 
-A lightweight Python connector for streaming CockroachDB changefeeds to Databricks Delta Lake.
-
-## Features
-
-- ✅ **Multiple CDC Modes**: Append-only (SCD Type 2) and Update-Delete (SCD Type 1)
-- ✅ **Format Support**: Parquet and JSON changefeed formats
-- ✅ **Column Families**: Automatic handling of split column families
-- ✅ **Auto-detection**: Primary keys and column families detected from CockroachDB
-- ✅ **Multiple Sources**: Unity Catalog Volumes, Azure Blob Storage, or Direct connection
-- ✅ **Production Ready**: Tested with real-world CDC workloads
+Stream CockroachDB data changes to Databricks Delta Lake using changefeeds, cloud storage, and Auto Loader. Supports both initial snapshots and ongoing CDC events (inserts, updates, deletes) with ACID guarantees.
 
 ## Quick Start
 
-### 1. Installation
+📖 Follow the **[Complete Tutorial](docs/stream-changefeed-to-databricks-azure.md)** for step-by-step setup of CockroachDB changefeeds, Unity Catalog External Volumes, and Auto Loader.
 
-```bash
-git clone https://github.com/rsleedbx/crdb_to_dbx.git
-cd crdb_to_dbx
-pip install -e .
-```
-
-### 2. Configuration
-
-Create configuration files in `.env/` directory:
-
-**`.env/cockroachdb_credentials.json`:**
-```json
-{
-  "host": "your-cluster.cockroachlabs.cloud",
-  "port": 26257,
-  "database": "defaultdb",
-  "user": "your_username",
-  "password": "your_password"
-}
-```
-
-**`.env/cockroachdb_pipelines.json`:**
-```json
-{
-  "catalog": "main",
-  "schema": "your_schema",
-  "volume_name": "cdc_files"
-}
-```
-
-See `config_examples/` for complete configuration templates.
-
-### 3. Run the Notebook
-
-1. Upload `notebooks/test_cdc_scenario.ipynb` to Databricks
-2. Update configuration variables in Step 2
-3. Run all cells
-
-## Architecture
-
-```
-CockroachDB Changefeed → Azure Blob Storage → Databricks Auto Loader → Delta Lake
-                              ↓
-                    Unity Catalog Volume (optional)
-```
-
-## Supported Modes
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| **VOLUME** | Read from Unity Catalog Volumes | File-based testing with pre-synced data |
-| **AZURE_PARQUET** | Read Parquet from Azure Blob | Production CDC (recommended) |
-| **AZURE_JSON** | Read JSON from Azure Blob | Development/debugging |
-| **AZURE_DUAL** | Read both Parquet and JSON | Format migration or validation |
-| **DIRECT** | Direct CockroachDB connection | Testing with sinkless changefeeds |
-
-## CDC Modes
-
-### Append-Only (SCD Type 2)
-Stores all CDC events (INSERT, UPDATE, DELETE) as rows for full history tracking.
+Once configured, run CDC ingestion in Databricks:
 
 ```python
-ITERATOR_MODE = ConnectorMode.VOLUME
-CDC_MODE = "append_only"  # Full history
-```
+from crdb_to_dbx.cockroachdb_config import load_and_process_config
+from crdb_to_dbx import ingest_cdc_with_merge_multi_family
 
-### Update-Delete (SCD Type 1)
-Maintains current state only using MERGE operations.
+# Load configuration
+config = load_and_process_config("config.json")
 
-```python
-CDC_MODE = "update_delete"  # Current state only
-```
-
-## Example Usage
-
-```python
-from crdb_to_dbx import ConnectorMode, load_and_merge_cdc_to_delta
-
-# Load and merge CDC data to Delta table
-result = load_and_merge_cdc_to_delta(
-    spark=spark,
-    source_table="usertable",
-    target_table="main.my_schema.usertable_cdc",
-    mode=ConnectorMode.VOLUME,
-    crdb_config={"host": "...", "database": "..."},
-    pipeline_config={"catalog": "main", "volume_name": "cdc_files"}
+# Run CDC ingestion (automatically handles storage, format, column families)
+query = ingest_cdc_with_merge_multi_family(
+    config=config,
+    spark=spark
 )
 ```
 
@@ -108,105 +26,87 @@ result = load_and_merge_cdc_to_delta(
 
 ```
 crdb_to_dbx/
-├── crdb_to_dbx/          # Main connector module
-│   ├── __init__.py
-│   └── connector.py      # Core CDC logic
-├── notebooks/            # Example notebooks
-│   └── test_cdc_scenario.ipynb
-├── config_examples/      # Configuration templates
-│   ├── volume_mode.json
+├── crdb_to_dbx/                    # Core CDC modules
+│   ├── cockroachdb_autoload.py     # Auto Loader + CDC ingestion
+│   ├── cockroachdb_storage.py      # Unified storage abstraction
+│   ├── cockroachdb_azure.py        # Azure Blob Storage provider
+│   ├── cockroachdb_uc_volume.py    # Unity Catalog Volume provider
+│   ├── cockroachdb_sql.py          # Changefeed management
+│   ├── cockroachdb_config.py       # Configuration handling
+│   ├── cockroachdb_ycsb.py         # Workload generation
+│   └── cockroachdb-cdc-tutorial.ipynb  # Interactive tutorial
+├── config_examples/                # Configuration templates
+│   ├── azure_json_mode.json
 │   ├── azure_parquet_mode.json
+│   ├── volume_mode.json
 │   └── README.md
+├── docs/                           # Documentation
+│   ├── stream-changefeed-to-databricks-azure.md
+│   └── learnings/                  # Historical docs
+├── scripts/                        # Setup automation
+│   └── 01_azure_storage.sh         # Azure + UC setup
 ├── README.md
 ├── setup.py
-├── requirements.txt
-└── .gitignore
+└── requirements.txt
 ```
 
 ## Requirements
 
 - Python 3.8+
 - PySpark 3.3+
-- Databricks Runtime 11.3+
-- Unity Catalog enabled
+- Databricks Runtime 13.3+ (or Serverless)
 - CockroachDB 22.1+ with changefeeds
+- Unity Catalog (optional, for UC Volume mode)
 
-## Configuration Examples
+## Tutorials & Examples
 
-### Volume Mode (File-based Testing)
-```json
-{
-  "pipeline_name": "my_cdc_pipeline",
-  "mode": "volume",
-  "catalog": "main",
-  "schema": "my_schema",
-  "volume_name": "cdc_files"
-}
-```
+### Interactive Tutorial
+The repository includes comprehensive tutorial notebooks:
 
-### Azure Parquet Mode (Production)
-```json
-{
-  "pipeline_name": "my_cdc_pipeline",
-  "mode": "azure_parquet",
-  "catalog": "main",
-  "schema": "my_schema",
-  "azure_config": ".env/azure_credentials.json",
-  "blob_prefix": "parquet/defaultdb/public/usertable"
-}
-```
+**`crdb_to_dbx/cockroachdb-cdc-tutorial.ipynb`**
+- Complete end-to-end CDC pipeline
+- All CDC modes (append-only, update-delete)
+- Both column family modes (single, multi)
+- RESOLVED watermarking examples
+- YCSB workload generation
 
-See `config_examples/` for all modes.
-
-## Column Families Support
-
-The connector automatically handles CockroachDB's `split_column_families` feature:
-
-1. **Detects** fragmented CDC events (one per column family)
-2. **Merges** fragments using `F.first(col, ignorenulls=True)`
-3. **Reconstructs** complete rows in Delta Lake
-
-Perfect for high-throughput workloads with many columns.
-
-## Testing
-
-The repository includes a comprehensive test notebook that validates:
-
+**Coverage:**
 - ✅ CDC event processing (INSERT, UPDATE, DELETE)
 - ✅ Column family fragment merging
 - ✅ Primary key auto-detection
-- ✅ Source-to-target data consistency
-- ✅ Multiple format support (Parquet, JSON)
+- ✅ RESOLVED watermark coordination
+- ✅ Multi-table transaction consistency
+- ✅ Both storage providers (Azure, UC Volume)
 
 ## Documentation
 
-- **[Configuration Guide](config_examples/README.md)** - Detailed configuration options
-- **[Blog Post: Stream CockroachDB CDC to Databricks](docs/stream-changefeed-to-databricks-azure.md)** - Complete tutorial
+### Getting Started
+- **[Complete Tutorial](docs/stream-changefeed-to-databricks-azure.md)** - Step-by-step guide with architecture and examples
+- **[Configuration Guide](config_examples/README.md)** - Configuration options and examples
+
+### Storage & Deployment
+- **[Storage Providers](docs/STORAGE_PROVIDERS.md)** - Choose and configure storage (Azure or UC Volume)
+- **[UC Volume Credentials](docs/UC_VOLUME_CREDENTIALS.md)** - When credentials are needed
+- **[UC Volume Auto Loader](docs/UC_VOLUME_AUTOLOADER.md)** - Auto Loader best practices
+
+### Troubleshooting
+- **[Troubleshooting Hangs](docs/TROUBLESHOOTING_HANG.md)** - Debug apparent hangs in file listing
+
+### Implementation Details
+- **[Learnings & Summaries](docs/learnings/README.md)** - Implementation learnings and bug fixes
+- **[Evolution Strategy](CONNECTOR_EVOLUTION_STRATEGY.md)** - Architectural decisions and roadmap
 
 ## Related Resources
 
 - [CockroachDB Changefeed Documentation](https://www.cockroachlabs.com/docs/stable/create-changefeed)
 - [Databricks Auto Loader](https://docs.databricks.com/ingestion/auto-loader/)
 - [Delta Lake MERGE INTO](https://docs.databricks.com/delta/merge.html)
+- [Unity Catalog External Volumes](https://docs.databricks.com/en/connect/unity-catalog/volumes.html)
 
 ## License
 
-Apache 2.0
-
-## Author
-
-Robert Lee ([@rsleedbx](https://github.com/rsleedbx))
+Apache 2.0 - See [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Contributions welcome! Please open an issue or PR.
-
-## Changelog
-
-### v1.0.0 (2026-01-30)
-- Initial release
-- Support for Parquet and JSON formats
-- Column family fragment merging
-- Multiple connector modes (VOLUME, AZURE, DIRECT)
-- Auto-detection of primary keys and column families
-- Production-ready CDC processing
+We welcome contributions! Please use GitHub Issues for bug reports and Pull Requests for changes.

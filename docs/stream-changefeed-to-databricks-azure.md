@@ -1,6 +1,6 @@
 # Stream a CockroachDB Changefeed to Databricks (Azure Edition)
 
-*By Robert Lee | January 30, 2026*
+*By Robert Lee | Updated February 4, 2026*
 
 ---
 
@@ -72,15 +72,36 @@ VALUES
 
 The CockroachDB changefeed automatically captures these changes and writes them to Azure Blob Storage.
 
-### Step 4. Configure Azure access *(Databricks)*
+### Step 4. Configure Unity Catalog access to Azure *(Databricks)*
 
-Configure Unity Catalog to access your Azure storage account using external locations with storage credentials. This approach works with all compute types including Databricks Serverless.
+Create an External Volume for governed, credential-free access to your Azure storage:
 
-See [Connect to cloud object storage using Unity Catalog](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/) for setup instructions.
+```sql
+-- 1. Create storage credential (one-time setup)
+CREATE STORAGE CREDENTIAL azure_cdc_credential
+WITH (AZURE_SERVICE_PRINCIPAL
+  '<client-id>',
+  '<directory-id>',
+  '<client-secret>'
+);
 
-### Step 5. Stream into Databricks Delta Lake *(Databricks)*
+-- 2. Create external location pointing to your container
+CREATE EXTERNAL LOCATION azure_cdc_location
+URL 'abfss://changefeed-events@{storage_account}.dfs.core.windows.net/'
+WITH (STORAGE CREDENTIAL azure_cdc_credential);
 
-Use Databricks Auto Loader to automatically ingest CDC files:
+-- 3. Create external volume
+CREATE EXTERNAL VOLUME cdc_volume
+LOCATION azure_cdc_location;
+```
+
+Now you can access CDC files using: `/Volumes/catalog/schema/cdc_volume/parquet/...`
+
+See [Connect to cloud object storage using Unity Catalog](https://learn.microsoft.com/en-us/azure/databricks/connect/unity-catalog/cloud-storage/) for detailed setup instructions.
+
+### Step 5. Stream into Databricks Delta Lake - Append-Only *(Databricks)*
+
+Use Databricks Auto Loader to automatically ingest CDC files in append-only mode (SCD Type 2):
 
 ```python
 from pyspark.sql import functions as F
@@ -136,33 +157,33 @@ ORDER BY _cdc_timestamp;
 
 ### Want more CDC capabilities?
 
-The complete working notebook (`sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`) includes additional CDC modes:
+The complete working notebook (`sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`) includes examples for both CDC modes with standard tables and CockroachDB column families:
 
-| CDC Mode | Target Behavior | Use Case |
-|----------|-----------------|----------|
-| **append_only** | All INSERT, UPDATE, DELETE events stored as rows | Full history (audit logs, compliance) |
-| **update_delete** | Latest INSERT/UPDATE/DELETE state only (MERGE INTO) | Current values (dashboards, reporting) |
+| CDC Mode | Target Behavior | Use Case | Column Family Examples |
+|----------|-----------------|----------|----------------------|
+| **append_only** | All INSERT, UPDATE, DELETE events stored as rows | Full history (audit logs, compliance) | ✅ single_cf, multi_cf |
+| **update_delete** | Latest INSERT/UPDATE/DELETE state only (MERGE INTO) | Current values (dashboards, reporting) | ✅ single_cf, multi_cf |
 
-With support for both standard tables and tables with column families (for write-heavy concurrent workloads).
+**CockroachDB Column Family Support:**
+
+CockroachDB [column families](https://www.cockroachlabs.com/docs/stable/column-families) group columns into separate key-value pairs to optimize write performance in concurrent workloads. When using `split_column_families` in changefeeds, CockroachDB generates multiple Parquet files per row update (one per column family), and the connector automatically merges these fragments.
+
+- **single_cf**: Standard tables (one column family, default behavior)
+  - Changefeed: `WITH format='parquet', updated, resolved='10s'`
+  - One Parquet file per CDC event
+  
+- **multi_cf**: Tables with column families split (`split_column_families`)
+  - Changefeed: `WITH format='parquet', split_column_families, updated, resolved='10s'`
+  - Multiple Parquet files per CDC event (fragments require merging)
+  - Recommended for wide tables (50+ columns) with write-heavy concurrent access patterns
 
 ---
 
 ## Architecture
 
-```
-                 ┌─────────────┐
-                 │ Changefeed  │
-                 └──────┬──────┘
-                        ↓
-CockroachDB ──→ Azure Blob Storage ──→ Databricks Auto Loader ──→ Delta Lake
-                (ADLS Gen2)               ↑
-                                          │
-                                   ┌──────┴───────┐
-                                   │Unity Catalog │
-                                   │ (Security &  │
-                                   │ Governance)  │
-                                   └──────────────┘
-```
+![CDC Architecture Diagram](mermaid-diagram-2026-02-04-193854.png)
+
+*The data flow from CockroachDB through Azure Blob Storage and Unity Catalog to Delta Lake using Databricks Auto Loader. [View Mermaid source](architecture-diagram.mmd)*
 
 ---
 
@@ -229,7 +250,7 @@ WITH
 ```python
 from crdb_to_dbx import merge_column_family_fragments
 
-# Use production-ready merge implementation
+# Merge column family fragments
 df_merged = merge_column_family_fragments(
     df=raw_df,
     primary_key_columns=["ycsb_key"]
@@ -237,6 +258,15 @@ df_merged = merge_column_family_fragments(
 
 # Write to target
 df_merged.writeStream.toTable(target_table)
+```
+
+**Note:** For complete CDC pipelines, use the higher-level ingestion functions:
+```python
+from crdb_to_dbx.cockroachdb_config import load_and_process_config
+from crdb_to_dbx import ingest_cdc_with_merge_multi_family
+
+config = load_and_process_config("config.json")
+query = ingest_cdc_with_merge_multi_family(config=config, spark=spark)
 ```
 
 The `merge_column_family_fragments` function groups by primary key and timestamp, then coalesces NULL values across fragments using PySpark aggregations.
@@ -268,8 +298,8 @@ from crdb_to_dbx import ingest_cdc_with_merge_multi_family
 result = ingest_cdc_with_merge_multi_family(
     config=config,
     spark=spark
-    # Automatically uses latest RESOLVED timestamp for filtering
 )
+# Automatically uses latest RESOLVED timestamp for filtering
 ```
 
 **What happens:**
@@ -278,13 +308,17 @@ result = ingest_cdc_with_merge_multi_family(
 3. Filters CDC events: `__crdb__updated <= watermark`
 4. Guarantees all column family fragments are complete
 
-For multi-table coordination, column family details, and advanced usage, see the [crdb_to_dbx implementation](https://github.com/rsleedbx/crdb_to_dbx/tree/master/crdb_to_dbx).
-
 ---
 
 ## Next Steps
 
-**Complete working notebook**: All CDC modes with production-ready code are available in `sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb`.
+**Complete working notebook**: All CDC modes and examples are available in `crdb_to_dbx/cockroachdb-cdc-tutorial.ipynb`.
+
+For multi-table coordination, column family details, and advanced usage examples, see the interactive tutorial notebook which includes:
+- All CDC modes (append-only, update-delete)
+- Both column family configurations (single_cf, multi_cf)
+- RESOLVED watermarking examples
+- Multi-table coordination patterns
 
 **Learn more:**
 - [CockroachDB Changefeed Documentation](https://www.cockroachlabs.com/docs/stable/create-changefeed)
@@ -297,8 +331,15 @@ For multi-table coordination, column family details, and advanced usage, see the
 
 **Author**: [Robert Lee](https://credentials.databricks.com/profile/robertlee941580/wallet), Field Engineer at Databricks
 
-This guide was created with guidance from [Andrew Deally](https://andrewdeally.medium.com/).
+This guide was created with guidance from:
+- [Andrew Deally](https://andrewdeally.medium.com/) - CockroachDB team for changefeed architecture and best practices
 
 ---
 
+## License & Contributing
+
 **License**: Apache 2.0
+
+We welcome contributions to this CockroachDB CDC to Databricks connector. We use GitHub Issues to track community reported issues and GitHub Pull Requests for accepting changes.
+
+See [LICENSE](../LICENSE) for the full Apache 2.0 license text.

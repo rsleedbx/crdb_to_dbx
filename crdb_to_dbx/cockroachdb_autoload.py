@@ -28,14 +28,24 @@ def _build_paths(config, mode_suffix=""):
     """
     Build source, checkpoint, and target paths from config.
     
+    Supports both Azure storage and UC external volume based on data_source configuration.
+    
     Args:
         config: Config dataclass from cockroachdb_config.py
         mode_suffix: Optional suffix for checkpoint path (e.g., "_merge", "_merge_cf")
     
     Returns:
         tuple: (source_path, checkpoint_path, target_table_fqn)
+    
+    Raises:
+        ValueError: If data source is not properly configured
     """
-    source_path = f"abfss://{config.azure_storage.container_name}@{config.azure_storage.account_name}.dfs.core.windows.net/{config.cdc_config.path}"
+    # Import here to avoid circular dependency
+    from cockroachdb_config import get_storage_path
+    
+    # Get source path based on data source
+    source_path = get_storage_path(config)
+    
     checkpoint_path = f"/checkpoints/{config.tables.destination_schema}_{config.tables.destination_table_name}{mode_suffix}"
     target_table_fqn = f"{config.tables.destination_catalog}.{config.tables.destination_schema}.{config.tables.destination_table_name}"
     return source_path, checkpoint_path, target_table_fqn
@@ -45,23 +55,36 @@ def _setup_autoloader(spark, source_path, checkpoint_path, source_table):
     """
     Set up Spark Auto Loader for CDC files.
     
+    Automatically detects storage type (Azure vs UC Volume) and applies appropriate settings:
+    - UC Volumes: Use directory listing (notifications not supported)
+    - Azure: Can use notifications or directory listing
+    
     Args:
         spark: SparkSession
-        source_path: Azure blob storage path to CDC files
+        source_path: Storage path to CDC files (Azure abfss:// or UC Volume /Volumes/)
         checkpoint_path: Checkpoint location for schema tracking
         source_table: Source table name for filtering files
     
     Returns:
         DataFrame: Streaming DataFrame with raw CDC data
     """
-    return (spark.readStream
+    # Detect if we're using UC Volume (path starts with /Volumes/)
+    is_uc_volume = source_path.startswith("/Volumes/")
+    
+    reader = (spark.readStream
         .format("cloudFiles")
         .option("cloudFiles.format", "parquet")
         .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema")
         .option("pathGlobFilter", f"*{source_table}*.parquet")
         .option("recursiveFileLookup", "true")
-        .load(source_path)
     )
+    
+    # For UC Volumes, explicitly disable notifications (not supported)
+    # and use directory listing instead
+    if is_uc_volume:
+        reader = reader.option("cloudFiles.useNotifications", "false")
+    
+    return reader.load(source_path)
 
 
 def _transform_cdc_columns(raw_df, resolved_watermark: Optional[int] = None):
@@ -154,15 +177,17 @@ def _print_ingestion_header(config, mode, column_family_mode, source_path, targe
     print()
 
 
-def _get_resolved_watermark(config, source_table: str) -> Optional[int]:
+def _get_resolved_watermark(config, source_table: str, spark=None) -> Optional[int]:
     """
     Get the latest RESOLVED timestamp watermark from CockroachDB CDC .RESOLVED files.
     
     RESOLVED files guarantee that all CDC events with timestamp ≤ RESOLVED have been written.
     This is CRITICAL for column family completeness - ensures all fragments have arrived.
     
+    Supports both Azure Blob Storage and Unity Catalog external volumes.
+    
     How it works:
-    1. Reads all .RESOLVED files for the source table from Azure Blob Storage (using Azure SDK)
+    1. Reads all .RESOLVED files for the source table from storage (Azure or UC Volume)
     2. Extracts the resolved timestamp from the filename (nanoseconds since epoch)
     3. Returns the MAXIMUM resolved timestamp (latest safe watermark)
     
@@ -170,36 +195,77 @@ def _get_resolved_watermark(config, source_table: str) -> Optional[int]:
     Example: ycsb.RESOLVED.1704067200000000000
     
     Args:
-        config: Configuration object with Azure credentials
+        config: Configuration object with storage credentials
         source_table: Source table name (e.g., "ycsb")
+        spark: SparkSession (required for UC Volume, optional for Azure)
     
     Returns:
         int: Latest RESOLVED timestamp in nanoseconds, or None if no RESOLVED files found
     
     Example:
-        >>> watermark = _get_resolved_watermark(config, "ycsb")
+        >>> watermark = _get_resolved_watermark(config, "ycsb", spark)
         >>> if watermark:
         >>>     print(f"Safe to process events up to {watermark} nanos")
         >>>     df = df.filter(F.col("__crdb__updated") <= watermark)
     """
     try:
-        # Import cockroachdb_azure (works in notebooks and when package is installed)
-        import cockroachdb_azure
+        # Check data source and use appropriate module
+        if config.data_source == "azure_storage":
+            # Import cockroachdb_azure (works in notebooks and when package is installed)
+            import cockroachdb_azure
+            
+            # Use Azure SDK to list files (works in all environments)
+            print(f"   🔍 Scanning for .RESOLVED files in Azure Blob Storage...")
+            
+            result = cockroachdb_azure.check_azure_files(
+                storage_account_name=config.azure_storage.account_name,
+                storage_account_key=config.azure_storage.account_key,
+                container_name=config.azure_storage.container_name,
+                source_catalog=config.tables.source_catalog,
+                source_schema=config.tables.source_schema,
+                source_table=source_table,
+                target_table=config.tables.destination_table_name,
+                verbose=False,
+                format=config.cdc_config.format
+            )
         
-        # Use Azure SDK to list files (works in all environments)
-        print(f"   🔍 Scanning for .RESOLVED files in Azure Blob Storage...")
+        elif config.data_source == "uc_external_volume":
+            # Import cockroachdb_uc_volume
+            import cockroachdb_uc_volume
+            from cockroachdb_config import get_volume_path
+            
+            # Use UC Volume functions
+            print(f"   🔍 Scanning for .RESOLVED files in Unity Catalog Volume...")
+            
+            if not spark:
+                print(f"   ⚠️  spark is required for UC Volume access")
+                print(f"      Proceeding without RESOLVED watermarking")
+                return None
+            
+            volume_path = get_volume_path(config)
+            print(f"   📂 Volume path: {volume_path}")
+            print(f"   ⏳ Listing files (this may take 5-10 seconds)...")
+            
+            import time
+            start_time = time.time()
+            
+            result = cockroachdb_uc_volume.check_volume_files(
+                volume_path=volume_path,
+                source_catalog=config.tables.source_catalog,
+                source_schema=config.tables.source_schema,
+                source_table=source_table,
+                target_table=config.tables.destination_table_name,
+                spark=spark,
+                verbose=False,
+                format=config.cdc_config.format
+            )
+            
+            elapsed = time.time() - start_time
+            print(f"   ✅ File listing completed in {elapsed:.1f}s")
         
-        result = cockroachdb_azure.check_azure_files(
-            storage_account_name=config.azure_storage.account_name,
-            storage_account_key=config.azure_storage.account_key,
-            container_name=config.azure_storage.container_name,
-            source_catalog=config.tables.source_catalog,
-            source_schema=config.tables.source_schema,
-            source_table=source_table,
-            target_table=config.tables.destination_table_name,
-            verbose=False,
-            format=config.cdc_config.format
-        )
+        else:
+            print(f"   ⚠️  Unknown data source: {config.data_source}")
+            return None
         
         resolved_files = result['resolved_files']
         
@@ -210,7 +276,7 @@ def _get_resolved_watermark(config, source_table: str) -> Optional[int]:
         
         print(f"   📁 Found {len(resolved_files)} .RESOLVED file(s)")
         if resolved_files:
-            print(f"   📄 Example RESOLVED file: {resolved_files[0].name}")
+            print(f"   📄 Example RESOLVED file: {resolved_files[0]['name']}")
         
         # Extract timestamps from filenames
         # CockroachDB RESOLVED file formats (observed patterns):
@@ -221,7 +287,8 @@ def _get_resolved_watermark(config, source_table: str) -> Optional[int]:
         for file in resolved_files:
             try:
                 # Get just the filename (not the full path)
-                full_path = file.name
+                # All storage backends now return dicts with ['name'] key
+                full_path = file['name']
                 filename = full_path.split('/')[-1]  # Get last part after /
                 
                 # Remove .parquet extension if present
@@ -319,23 +386,26 @@ def _resolve_watermark(
     config,
     source_table: str,
     resolved_watermark: Optional[int],
-    is_multi_cf: bool = False
+    is_multi_cf: bool = False,
+    spark=None
 ) -> Optional[int]:
     """
     Resolve the RESOLVED watermark to use for CDC ingestion.
     
     This helper consolidates watermark resolution logic across all ingestion functions.
+    Supports both Azure Blob Storage and Unity Catalog external volumes.
     
     Logic:
     1. If watermark disabled in config: Return None (no watermarking)
     2. If watermark provided by caller: Use it (multi-table coordination)
-    3. Otherwise: Compute from .RESOLVED files (using Azure SDK)
+    3. Otherwise: Compute from .RESOLVED files (using Azure SDK or Spark listing)
     
     Args:
-        config: Config dataclass with Azure credentials
+        config: Config dataclass with storage credentials
         source_table: Source table name
         resolved_watermark: Optional watermark provided by caller
         is_multi_cf: True if multi-CF mode (affects warning messages)
+        spark: SparkSession (required for UC Volume, optional for Azure)
     
     Returns:
         int: RESOLVED timestamp in nanoseconds, or None if disabled/unavailable
@@ -367,7 +437,7 @@ def _resolve_watermark(
     else:
         print("🔒 RESOLVED Watermarking: ENABLED (optional for single-CF tables)")
     
-    computed_watermark = _get_resolved_watermark(config, source_table)
+    computed_watermark = _get_resolved_watermark(config, source_table, spark)
     
     if computed_watermark and is_multi_cf:
         print("   ✅ RESOLVED watermark will be applied to CDC events")
@@ -603,7 +673,7 @@ def ingest_cdc_append_only_single_family(
     Ingest CDC events in APPEND-ONLY mode for single column family tables.
     
     This function:
-    - Reads Parquet CDC files from Azure using Auto Loader
+    - Reads Parquet CDC files from storage (Azure or UC Volume) using Auto Loader
     - Filters out .RESOLVED files and metadata
     - Transforms CockroachDB CDC columns (__crdb__*) to standard format
     - Writes all events (INSERT/UPDATE/DELETE) as rows to Delta table
@@ -635,7 +705,8 @@ def ingest_cdc_append_only_single_family(
         config=config,
         source_table=config.tables.source_table_name,
         resolved_watermark=resolved_watermark,
-        is_multi_cf=False  # Single-CF mode
+        is_multi_cf=False,  # Single-CF mode
+        spark=spark
     )
     
     # Read with Auto Loader
@@ -670,7 +741,7 @@ def ingest_cdc_with_merge_single_family(
     Ingest CDC events with MERGE logic for single column family tables.
     
     This function:
-    - Reads Parquet CDC files from Azure using Auto Loader
+    - Reads Parquet CDC files from storage (Azure or UC Volume) using Auto Loader
     - Filters out .RESOLVED files and metadata
     - Transforms CockroachDB CDC columns (__crdb__*) to standard format
     - Deduplicates events within each microbatch (handles column family fragments)
@@ -720,7 +791,8 @@ def ingest_cdc_with_merge_single_family(
         config=config,
         source_table=config.tables.source_table_name,
         resolved_watermark=resolved_watermark,
-        is_multi_cf=False  # Single-CF mode
+        is_multi_cf=False,  # Single-CF mode
+        spark=spark
     )
     
     # Read with Auto Loader
@@ -1189,7 +1261,7 @@ def ingest_cdc_append_only_multi_family(
     - Stage 2: Batch merge column family fragments to target table
     
     This function:
-    - Reads Parquet CDC files from Azure using Auto Loader
+    - Reads Parquet CDC files from storage (Azure or UC Volume) using Auto Loader
     - Filters out .RESOLVED files and metadata
     - Transforms CockroachDB CDC columns (__crdb__*) to standard format
     - MERGES column family fragments (split_column_families=true) in batch mode
@@ -1228,7 +1300,8 @@ def ingest_cdc_append_only_multi_family(
         config=config,
         source_table=config.tables.source_table_name,
         resolved_watermark=resolved_watermark,
-        is_multi_cf=True  # Multi-CF mode - CRITICAL for completeness
+        is_multi_cf=True,  # Multi-CF mode - CRITICAL for completeness
+        spark=spark
     )
     
     # Read with Auto Loader
@@ -1303,7 +1376,7 @@ def ingest_cdc_with_merge_multi_family(
     - Stage 2: Batch merge column families + deduplicate + MERGE to target
     
     This function:
-    - Reads Parquet CDC files from Azure using Auto Loader
+    - Reads Parquet CDC files from storage (Azure or UC Volume) using Auto Loader
     - Filters out .RESOLVED files and metadata
     - Transforms CockroachDB CDC columns (__crdb__*) to standard format
     - MERGES column family fragments (split_column_families=true) in batch mode
@@ -1351,7 +1424,8 @@ def ingest_cdc_with_merge_multi_family(
         config=config,
         source_table=config.tables.source_table_name,
         resolved_watermark=resolved_watermark,
-        is_multi_cf=True  # Multi-CF mode - CRITICAL for completeness
+        is_multi_cf=True,  # Multi-CF mode - CRITICAL for completeness
+        spark=spark
     )
     
     # Read with Auto Loader

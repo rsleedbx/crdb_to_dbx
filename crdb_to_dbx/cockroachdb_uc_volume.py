@@ -1,96 +1,156 @@
 """
-CockroachDB CDC Azure Utilities
+CockroachDB CDC Unity Catalog Volume Utilities
 
-This module provides Azure Blob Storage utilities for CockroachDB CDC changefeeds.
+This module provides Unity Catalog Volume utilities for CockroachDB CDC changefeeds.
+
+This module maintains the same function signatures as cockroachdb_azure.py to enable
+easy addition of other cloud providers (AWS S3, GCP GCS, Cloudflare R2, etc.) in the future.
+
+Design Pattern:
+    - Same function signatures across all cloud/storage providers
+    - Provider-specific implementation details hidden
+    - Easy to swap between providers or add new ones
+    
+Example:
+    # Azure
+    from cockroachdb_azure import check_azure_files, wait_for_changefeed_files
+    
+    # Unity Catalog Volume
+    from cockroachdb_uc_volume import check_volume_files, wait_for_changefeed_files
+    
+    # Future: AWS S3
+    from cockroachdb_s3 import check_s3_files, wait_for_changefeed_files
 """
 
 import time
 from typing import Dict, Any, List, Optional
-from azure.storage.blob import BlobServiceClient
 
 
-def check_azure_files(
-    storage_account_name: str,
-    storage_account_key: str,
-    container_name: str,
+def check_volume_files(
+    volume_path: str,
     source_catalog: str,
     source_schema: str,
     source_table: str,
     target_table: str,
+    spark,
     verbose: bool = True,
     format: str = "parquet"
 ) -> Dict[str, Any]:
     """
-    Check for changefeed files in Azure Blob Storage.
+    Check for changefeed files in Unity Catalog Volume.
+    
+    This function has the same signature pattern as check_azure_files() to enable
+    easy addition of other cloud providers in the future.
     
     Args:
-        storage_account_name: Azure storage account name
-        storage_account_key: Azure storage account key
-        container_name: Azure container name
+        volume_path: Unity Catalog Volume path (e.g., '/Volumes/main/default/cdc')
         source_catalog: CockroachDB catalog (database)
         source_schema: CockroachDB schema
         source_table: Source table name
         target_table: Target table name
+        spark: SparkSession (required for Unity Catalog operations)
         verbose: Print detailed output
         format: Changefeed format (default: "parquet")
     
     Returns:
         dict with 'data_files' and 'resolved_files' lists
+        
+        data_files: List of file info dicts with keys:
+            - name: filename
+            - path: full path
+            - size: file size in bytes
+        
+        resolved_files: List of RESOLVED file info dicts (same structure)
     
     Example:
-        >>> result = check_azure_files(
-        ...     storage_account_name="mystorageaccount",
-        ...     storage_account_key="<key>",
-        ...     container_name="cockroachcdc",
+        >>> result = check_volume_files(
+        ...     volume_path="/Volumes/main/default/cdc",
         ...     source_catalog="defaultdb",
         ...     source_schema="public",
         ...     source_table="usertable",
-        ...     target_table="usertable_append_only_multi_cf"
+        ...     target_table="usertable_append_only",
+        ...     spark=spark
         ... )
         >>> print(f"Found {len(result['data_files'])} data files")
     """
-    # Connect to Azure
-    connection_string = f"DefaultEndpointsProtocol=https;AccountName={storage_account_name};AccountKey={storage_account_key};EndpointSuffix=core.windows.net"
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
-    container_client = blob_service.get_container_client(container_name)
+    # Build path - same structure as Azure blob storage
+    # Format: {format}/{source_catalog}/{source_schema}/{source_table}/{target_table}/
+    path_prefix = f"{format}/{source_catalog}/{source_schema}/{source_table}/{target_table}/"
+    full_path = f"{volume_path.rstrip('/')}/{path_prefix}"
     
-    # Build path - list ALL files recursively under this changefeed path
-    prefix = f"{format}/{source_catalog}/{source_schema}/{source_table}/{target_table}/"
+    # Use Spark to list files in parallel
+    if verbose:
+        print(f"   🚀 Using Spark for fast parallel file listing...")
     
-    # List all blobs recursively (no date filtering)
-    blobs = list(container_client.list_blobs(name_starts_with=prefix))
+    # Use Spark's file listing which is parallelized
+    from pyspark.sql.utils import AnalysisException
     
-    # Convert blobs to standard dict format (same as UC Volume)
-    # This ensures consistent format across all storage backends
-    all_files = [
-        {
-            'name': b.name,
-            'path': b.name,  # Azure blobs use 'name' as the full path
-            'size': b.size
-        }
-        for b in blobs
-    ]
+    try:
+        if verbose:
+            print(f"   ⏳ Spark: Reading directory structure...")
+        
+        # Try to read the directory structure using Spark
+        file_df = spark.read.format("binaryFile").option("recursiveFileLookup", "true").load(full_path)
+        
+        if verbose:
+            print(f"   ⏳ Spark: Collecting file paths...")
+        
+        file_paths = [row.path for row in file_df.select("path").collect()]
+        
+        if verbose:
+            print(f"   ✅ Spark: Found {len(file_paths)} total paths")
+        
+        # Convert to file info dicts
+        all_files = []
+        for path in file_paths:
+            filename = path.split('/')[-1]
+            
+            # Skip metadata directory and underscore files (but NOT .RESOLVED)
+            if '/_metadata/' in path or (filename.startswith('_') and '.RESOLVED' not in filename):
+                continue
+            
+            # Include data files AND .RESOLVED files
+            if (filename.endswith('.parquet') or filename.endswith('.json') or 
+                filename.endswith('.ndjson') or '.RESOLVED' in filename):
+                all_files.append({
+                    'name': filename,
+                    'path': path,
+                    'size': 0  # Size not available from binaryFile format
+                })
+                
+    except AnalysisException as e:
+        # Directory doesn't exist or is empty - treat as empty directory
+        if verbose:
+            print(f"   ℹ️  Directory not found or empty: {full_path}")
+        all_files = []
+    except Exception as e:
+        # Other errors - fail with exception
+        raise RuntimeError(
+            f"Failed to list files in Unity Catalog Volume path: {full_path}\n"
+            f"Error: {e}"
+        ) from e
     
-    # Categorize files (using same filtering logic as cockroachdb.py)
-    # Data files: .parquet files, excluding:
+    # Categorize files (same logic as Azure module)
+    # Data files: .parquet/.json files, excluding:
     #   - .RESOLVED files (CDC watermarks)
     #   - _metadata/ directory (schema files)
     #   - Files starting with _ (_SUCCESS, _committed_*, etc.)
     data_files = [
         f for f in all_files 
-        if f['name'].endswith('.parquet') 
+        if (f['name'].endswith('.parquet') or f['name'].endswith('.json') or f['name'].endswith('.ndjson'))
         and '.RESOLVED' not in f['name']
-        and '/_metadata/' not in f['name']
-        and not f['name'].split('/')[-1].startswith('_')
+        and '/_metadata/' not in f['path']
+        and not f['name'].startswith('_')
     ]
+    
     resolved_files = [f for f in all_files if '.RESOLVED' in f['name']]
     
     if verbose:
-        print(f"📁 Files in Azure changefeed path:")
-        print(f"   Path: {prefix}")
+        print(f"📁 Files in Unity Catalog Volume:")
+        print(f"   Path: {full_path}")
         print(f"   📄 Data files: {len(data_files)}")
         print(f"   🕐 Resolved files: {len(resolved_files)}")
-        print(f"   📊 Total: {len(blobs)}")
+        print(f"   📊 Total: {len(all_files)}")
         
         if data_files:
             print(f"\n   Example data file:")
@@ -99,18 +159,17 @@ def check_azure_files(
     return {
         'data_files': data_files,
         'resolved_files': resolved_files,
-        'total': len(blobs)
+        'total': len(all_files)
     }
 
 
 def wait_for_changefeed_files(
-    storage_account_name: str,
-    storage_account_key: str,
-    container_name: str,
+    volume_path: str,
     source_catalog: str,
     source_schema: str,
     source_table: str,
     target_table: str,
+    spark,
     max_wait: int = 120,
     check_interval: int = 5,
     stabilization_wait: Optional[int] = None,
@@ -118,7 +177,10 @@ def wait_for_changefeed_files(
     wait_for_resolved: bool = True
 ) -> Dict[str, Any]:
     """
-    Wait for changefeed files to appear in Azure with timeout.
+    Wait for changefeed files to appear in Unity Catalog Volume with timeout.
+    
+    This function has the same signature pattern as the Azure version to enable
+    easy addition of other cloud providers in the future.
     
     This function can operate in two modes:
     1. RESOLVED mode (wait_for_resolved=True): Waits for .RESOLVED file to appear ✅ RECOMMENDED
@@ -133,13 +195,12 @@ def wait_for_changefeed_files(
        - Not recommended for production (use RESOLVED mode instead)
     
     Args:
-        storage_account_name: Azure storage account name
-        storage_account_key: Azure storage account key
-        container_name: Azure container name
+        volume_path: Unity Catalog Volume path (e.g., '/Volumes/main/default/cdc')
         source_catalog: CockroachDB catalog (database)
         source_schema: CockroachDB schema
         source_table: Source table name
         target_table: Target table name
+        spark: SparkSession (required for Unity Catalog operations)
         max_wait: Maximum seconds to wait for files (default: 120)
         check_interval: Seconds between checks (default: 5)
         stabilization_wait: Seconds to wait for file count to stabilize (default: None)
@@ -159,37 +220,24 @@ def wait_for_changefeed_files(
     
     Example (RESOLVED mode - Recommended):
         >>> result = wait_for_changefeed_files(
-        ...     storage_account_name="mystorageaccount",
-        ...     storage_account_key="<key>",
-        ...     container_name="cockroachcdc",
+        ...     volume_path="/Volumes/main/default/cdc",
         ...     source_catalog="defaultdb",
         ...     source_schema="public",
         ...     source_table="usertable",
         ...     target_table="usertable",
+        ...     spark=spark,
         ...     max_wait=300,
         ...     wait_for_resolved=True  # ✅ Wait for RESOLVED
         ... )
         >>> if result['success']:
         ...     print(f"RESOLVED file: {result['resolved_file']}")
         ...     # Use for watermark coordination
-    
-    Example (Legacy mode):
-        >>> result = wait_for_changefeed_files(
-        ...     storage_account_name="mystorageaccount",
-        ...     storage_account_key="<key>",
-        ...     container_name="cockroachcdc",
-        ...     source_catalog="defaultdb",
-        ...     source_schema="public",
-        ...     source_table="usertable",
-        ...     target_table="usertable",
-        ...     wait_for_resolved=False  # Legacy data file mode
-        ... )
     """
     if wait_for_resolved:
         # ====================================================================
         # RESOLVED MODE: Wait for .RESOLVED file (RECOMMENDED)
         # ====================================================================
-        print(f"⏳ Waiting for RESOLVED file to appear in Azure...")
+        print(f"⏳ Waiting for RESOLVED file to appear in Unity Catalog Volume...")
         print(f"   This ensures all CDC events and column family fragments are complete")
         print(f"   No stabilization wait needed - RESOLVED guarantees completeness")
         
@@ -197,11 +245,9 @@ def wait_for_changefeed_files(
         resolved_file = None
         
         while elapsed < max_wait:
-            result = check_azure_files(
-                storage_account_name, storage_account_key, container_name,
-                source_catalog, source_schema, source_table, target_table,
-                verbose=False,
-                format=format
+            result = check_volume_files(
+                volume_path, source_catalog, source_schema, source_table, target_table,
+                spark, verbose=False, format=format
             )
             
             resolved_files = result['resolved_files']
@@ -249,7 +295,7 @@ def wait_for_changefeed_files(
         if stabilization_wait is None:
             stabilization_wait = 5  # Default 5 seconds for legacy mode
         
-        print(f"⏳ Waiting for initial snapshot files to appear in Azure...")
+        print(f"⏳ Waiting for initial snapshot files to appear in Unity Catalog Volume...")
         print(f"   (Legacy mode - consider using wait_for_resolved=True)")
         print(f"   Using stabilization wait: {stabilization_wait}s")
         
@@ -259,11 +305,9 @@ def wait_for_changefeed_files(
         stable_elapsed = 0
         
         while elapsed < max_wait:
-            result = check_azure_files(
-                storage_account_name, storage_account_key, container_name,
-                source_catalog, source_schema, source_table, target_table,
-                verbose=False,
-                format=format
+            result = check_volume_files(
+                volume_path, source_catalog, source_schema, source_table, target_table,
+                spark, verbose=False, format=format
             )
             
             current_file_count = len(result['data_files'])
@@ -308,149 +352,58 @@ def wait_for_changefeed_files(
             elapsed += check_interval
         
         # Timeout
-        if files_found:
-            print(f"\n⚠️  Timeout after {max_wait}s (found {last_file_count} files but more may still be generating)")
-        else:
-            print(f"\n⚠️  Timeout after {max_wait}s - no files appeared")
+        print(f"\n⚠️  Timeout after {max_wait}s - no files appeared")
+        print(f"   Check:")
+        print(f"   1. Changefeed is running")
+        print(f"   2. Files are being written to volume")
+        print(f"   3. Path is correct: {volume_path}/{format}/{source_catalog}/{source_schema}/{source_table}/{target_table}/")
         
         return {
-            'success': files_found,
+            'success': False,
             'resolved_file': None,
             'elapsed_time': elapsed,
-            'file_count': last_file_count
+            'file_count': 0
         }
 
 
-def delete_changefeed_files(
-    storage_account_name: str,
-    storage_account_key: str,
-    container_name: str,
-    changefeed_path: str,
-    verbose: bool = True
+# ============================================================================
+# Future Extension Example (Template for AWS S3, GCP GCS, Cloudflare R2, etc.)
+# ============================================================================
+"""
+To add a new cloud provider, create cockroachdb_<provider>.py with these functions:
+
+def check_<provider>_files(
+    <provider_specific_params>,  # e.g., bucket_name, access_key for S3
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str,
+    verbose: bool = True,
+    format: str = "parquet"
 ) -> Dict[str, Any]:
-    """
-    Delete all changefeed files in Azure Blob Storage for a given path.
-    
-    ⚠️  WARNING: This permanently deletes all CDC data at the specified path!
-    
-    Use this when:
-    - Starting completely fresh
-    - Old data from previous runs is causing sync issues
-    - Table schema changed (e.g., VARCHAR → INT)
-    
-    Args:
-        storage_account_name: Azure storage account name
-        storage_account_key: Azure storage account key
-        container_name: Azure container name
-        changefeed_path: Path to delete (e.g., "parquet/defaultdb/public/usertable/target_table")
-                        Can also use config.cdc_config.path from Config dataclass
-        verbose: Print detailed output (default: True)
-    
-    Returns:
-        dict with keys:
-            - deleted_count: Number of items deleted
-            - failed_count: Number of items that failed to delete
-            - data_files_deleted: Number of .parquet data files deleted
-            - resolved_files_deleted: Number of .RESOLVED files deleted
-            - directories_deleted: Number of directory markers deleted
-    
-    Example:
-        >>> # Using config dataclass
-        >>> result = delete_changefeed_files(
-        ...     storage_account_name=config.azure_storage.account_name,
-        ...     storage_account_key=config.azure_storage.account_key,
-        ...     container_name=config.azure_storage.container_name,
-        ...     changefeed_path=config.cdc_config.path
-        ... )
-        >>> print(f"Deleted {result['deleted_count']} items")
-        
-        >>> # Manual path
-        >>> result = delete_changefeed_files(
-        ...     storage_account_name="mystorageaccount",
-        ...     storage_account_key="<key>",
-        ...     container_name="cockroachcdc",
-        ...     changefeed_path="parquet/defaultdb/public/usertable/target_table"
-        ... )
-    """
-    # Ensure path ends with / for prefix matching
-    if not changefeed_path.endswith('/'):
-        changefeed_path = f"{changefeed_path}/"
-    
-    if verbose:
-        print(f"🗑️  Deleting Azure changefeed data...")
-        print(f"=" * 80)
-        print(f"Container: {container_name}")
-        print(f"Path: {changefeed_path}")
-        print()
-    
-    # Connect to Azure
-    connection_string = f"DefaultEndpointsProtocol=https;AccountName={storage_account_name};AccountKey={storage_account_key};EndpointSuffix=core.windows.net"
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
-    container_client = blob_service.get_container_client(container_name)
-    
-    # List all blobs with this prefix
-    if verbose:
-        print(f"🔍 Scanning for files...")
-    
-    blobs = list(container_client.list_blobs(name_starts_with=changefeed_path))
-    
-    if not blobs:
-        if verbose:
-            print(f"ℹ️  No files found at: {changefeed_path}")
-            print(f"   Files may have already been deleted, or path is incorrect")
-        return {
-            'deleted_count': 0,
-            'failed_count': 0,
-            'data_files_deleted': 0,
-            'resolved_files_deleted': 0,
-            'directories_deleted': 0
-        }
-    
-    # Categorize items
-    data_files = [b for b in blobs if b.size > 0 and '.parquet' in b.name and '.RESOLVED' not in b.name]
-    resolved_files = [b for b in blobs if '.RESOLVED' in b.name]
-    directories = [b for b in blobs if b.size == 0]
-    
-    if verbose:
-        print(f"✅ Found {len(blobs)} items to delete")
-        print(f"   📄 Data files: {len(data_files)}")
-        print(f"   🕐 Resolved files: {len(resolved_files)}")
-        print(f"   📁 Directories: {len(directories)}")
-        print()
-    
-    # Delete all blobs
-    if verbose:
-        print(f"🔄 Deleting {len(blobs)} items...")
-    
-    deleted = 0
-    failed = 0
-    
-    for blob in blobs:
-        try:
-            container_client.delete_blob(blob.name)
-            deleted += 1
-            if verbose and deleted % 50 == 0:
-                print(f"   Deleted {deleted}/{len(blobs)} items...", end='\r')
-        except Exception as e:
-            # Some errors are expected (e.g., directories already removed, blob not found)
-            error_str = str(e)
-            if "DirectoryIsNotEmpty" not in error_str and "BlobNotFound" not in error_str:
-                failed += 1
-                if verbose:
-                    print(f"\n   ⚠️  Failed: {blob.name[:60]}... - {e}")
-    
-    if verbose:
-        print(f"✅ Deleted {deleted} items from Azure                    ")
-        if failed > 0:
-            print(f"   ⚠️  Failed to delete {failed} items")
-        print()
-        print(f"=" * 80)
-        print(f"✅ Cleanup complete!")
-    
-    return {
-        'deleted_count': deleted,
-        'failed_count': failed,
-        'data_files_deleted': len(data_files),
-        'resolved_files_deleted': len(resolved_files),
-        'directories_deleted': len(directories)
-    }
+    # Provider-specific implementation
+    # Returns same structure: {'data_files': [...], 'resolved_files': [...], 'total': int}
+    pass
+
+def wait_for_changefeed_files(
+    <provider_specific_params>,
+    source_catalog: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str,
+    max_wait: int = 120,
+    check_interval: int = 5,
+    stabilization_wait: Optional[int] = None,
+    format: str = "parquet",
+    wait_for_resolved: bool = True
+) -> Dict[str, Any]:
+    # Provider-specific implementation
+    # Returns same structure: {'success': bool, 'resolved_file': str, 'elapsed_time': int, 'file_count': int}
+    pass
+
+Examples:
+- cockroachdb_s3.py (AWS S3)
+- cockroachdb_gcs.py (Google Cloud Storage)
+- cockroachdb_r2.py (Cloudflare R2)
+- cockroachdb_minio.py (MinIO)
+"""

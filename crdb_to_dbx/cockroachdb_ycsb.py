@@ -104,6 +104,9 @@ def get_table_stats(conn, table_name: str) -> Dict[str, Any]:
     result = conn.run(f"SELECT MIN(ycsb_key), MAX(ycsb_key), COUNT(*) FROM {table_name}")
     min_key, max_key, count = result[0]
     
+    # Commit to close the read transaction - prevents conflicts with subsequent write transactions
+    conn.commit()
+    
     return {
         'min_key': min_key,
         'max_key': max_key,
@@ -178,6 +181,10 @@ def get_column_sum(conn, table_name: str, column_name: str) -> int:
         ) 
         FROM {table_name}
     """)
+    
+    # Commit to close the read transaction - prevents conflicts with subsequent write transactions
+    conn.commit()
+    
     return result[0][0] if result and result[0][0] is not None else 0
 
 
@@ -685,80 +692,120 @@ def run_ycsb_workload_with_random_nulls(
     print(f"   Min key: {min_key}, Max key: {max_key}, Total rows: {count_before}")
     print()
     
-    with conn.cursor() as cur:
-        
-        # 1. INSERT: Add new rows starting from max_key + 1 (using generate_series)
-        print(f"➕ Running {insert_count} INSERTs (keys {max_key + 1} to {max_key + insert_count})...")
-        insert_sql = f"""
-        INSERT INTO {table_name} 
-        (ycsb_key, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9)
-        SELECT 
-            i AS ycsb_key,
-            'inserted_value_' || i || '_0' AS field0,
-            'inserted_value_' || i || '_1' AS field1,
-            'inserted_value_' || i || '_2' AS field2,
-            'inserted_value_' || i || '_3' AS field3,
-            'inserted_value_' || i || '_4' AS field4,
-            'inserted_value_' || i || '_5' AS field5,
-            'inserted_value_' || i || '_6' AS field6,
-            'inserted_value_' || i || '_7' AS field7,
-            'inserted_value_' || i || '_8' AS field8,
-            'inserted_value_' || i || '_9' AS field9
-        FROM generate_series(%s, %s) AS i
-        """
-        cur.execute(insert_sql, (max_key + 1, max_key + insert_count))
-        
-        # 2. UPDATE: Update existing rows with random NULLs
-        print(f"📝 Running {update_count} UPDATEs with random NULLs...")
-        print(f"   NULL probability: {null_probability:.1%}")
-        print(f"   Columns to randomize: {', '.join(columns_to_randomize)}")
-        if force_all_null_update:
-            print(f"   ⚠️  First updated row (key {min_key}) will have ALL randomized columns as NULL")
-        
-        timestamp = int(time.time())
-        
-        # Update rows individually to control NULL randomization
-        for idx in range(update_count):
-            key = min_key + idx
-            
-            # Force all NULLs for the first update if requested (edge case testing)
-            force_null_this_update = (idx == 0 and force_all_null_update)
-            
-            # Build UPDATE statement with random NULLs
-            update_parts = []
-            for field_num in range(10):
-                field_name = f'field{field_num}'
+    # Retry loop for CockroachDB serializable transaction errors
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count <= max_retries:
+        try:
+            with conn.cursor() as cur:
                 
-                if field_name in columns_to_randomize:
-                    # Force NULL for edge case, or randomly decide
-                    if force_null_this_update or random.random() < null_probability:
-                        update_parts.append(f"{field_name} = NULL")
-                    else:
-                        update_parts.append(f"{field_name} = 'updated_at_{timestamp}_{field_num}'")
-                else:
-                    # Not randomized - always update with value
-                    if field_name == 'field0':
-                        # Special handling for field0 (timestamp marker)
-                        update_parts.append(f"{field_name} = 'updated_at_{timestamp}'")
-                    else:
-                        update_parts.append(f"{field_name} = 'updated_at_{timestamp}_{field_num}'")
+                # 1. INSERT: Add new rows starting from max_key + 1 (using generate_series)
+                print(f"➕ Running {insert_count} INSERTs (keys {max_key + 1} to {max_key + insert_count})...")
+                insert_sql = f"""
+                INSERT INTO {table_name} 
+                (ycsb_key, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9)
+                SELECT 
+                    i AS ycsb_key,
+                    'inserted_value_' || i || '_0' AS field0,
+                    'inserted_value_' || i || '_1' AS field1,
+                    'inserted_value_' || i || '_2' AS field2,
+                    'inserted_value_' || i || '_3' AS field3,
+                    'inserted_value_' || i || '_4' AS field4,
+                    'inserted_value_' || i || '_5' AS field5,
+                    'inserted_value_' || i || '_6' AS field6,
+                    'inserted_value_' || i || '_7' AS field7,
+                    'inserted_value_' || i || '_8' AS field8,
+                    'inserted_value_' || i || '_9' AS field9
+                FROM generate_series(%s, %s) AS i
+                """
+                cur.execute(insert_sql, (max_key + 1, max_key + insert_count))
+                
+                # 2. UPDATE: Update existing rows with random NULLs
+                print(f"📝 Running {update_count} UPDATEs with random NULLs...")
+                print(f"   NULL probability: {null_probability:.1%}")
+                print(f"   Columns to randomize: {', '.join(columns_to_randomize)}")
+                if force_all_null_update:
+                    print(f"   ⚠️  First updated row (key {min_key}) will have ALL randomized columns as NULL")
+                
+                timestamp = int(time.time())
+                
+                # Update rows individually to control NULL randomization
+                for idx in range(update_count):
+                    key = min_key + idx
+                    
+                    # Force all NULLs for the first update if requested (edge case testing)
+                    force_null_this_update = (idx == 0 and force_all_null_update)
+                    
+                    # Build UPDATE statement with random NULLs
+                    update_parts = []
+                    for field_num in range(10):
+                        field_name = f'field{field_num}'
+                        
+                        if field_name in columns_to_randomize:
+                            # Force NULL for edge case, or randomly decide
+                            if force_null_this_update or random.random() < null_probability:
+                                update_parts.append(f"{field_name} = NULL")
+                            else:
+                                update_parts.append(f"{field_name} = 'updated_at_{timestamp}_{field_num}'")
+                        else:
+                            # Not randomized - always update with value
+                            if field_name == 'field0':
+                                # Special handling for field0 (timestamp marker)
+                                update_parts.append(f"{field_name} = 'updated_at_{timestamp}'")
+                            else:
+                                update_parts.append(f"{field_name} = 'updated_at_{timestamp}_{field_num}'")
+                    
+                    update_sql = f"""
+                        UPDATE {table_name}
+                        SET {', '.join(update_parts)}
+                        WHERE ycsb_key = %s
+                    """
+                    cur.execute(update_sql, (key,))
+                
+                # 3. DELETE: Delete oldest rows starting from min_key (single DELETE)
+                delete_max = min_key + delete_count - 1
+                print(f"🗑️  Running {delete_count} DELETEs (keys {min_key} to {delete_max})...")
+                cur.execute(f"""
+                    DELETE FROM {table_name}
+                    WHERE ycsb_key >= %s AND ycsb_key <= %s
+                """, (min_key, delete_max))
+                
+                conn.commit()
             
-            update_sql = f"""
-                UPDATE {table_name}
-                SET {', '.join(update_parts)}
-                WHERE ycsb_key = %s
-            """
-            cur.execute(update_sql, (key,))
-        
-        # 3. DELETE: Delete oldest rows starting from min_key (single DELETE)
-        delete_max = min_key + delete_count - 1
-        print(f"🗑️  Running {delete_count} DELETEs (keys {min_key} to {delete_max})...")
-        cur.execute(f"""
-            DELETE FROM {table_name}
-            WHERE ycsb_key >= %s AND ycsb_key <= %s
-        """, (min_key, delete_max))
-        
-        conn.commit()
+            # Transaction succeeded - break out of retry loop
+            break
+            
+        except Exception as e:
+            # Check if this is a CockroachDB retry error (40001)
+            error_dict = e.args[0] if e.args and isinstance(e.args[0], dict) else {}
+            error_code = error_dict.get('C', '')
+            error_msg = error_dict.get('M', str(e))
+            
+            is_retry_error = (
+                error_code == '40001' or
+                'RETRY_SERIALIZABLE' in error_msg or
+                'restart transaction' in error_msg
+            )
+            
+            if is_retry_error and retry_count < max_retries:
+                retry_count += 1
+                print(f"⚠️  Transaction retry error (attempt {retry_count}/{max_retries})")
+                print(f"   Retrying...")
+                
+                # Rollback and retry
+                try:
+                    conn.run("ROLLBACK")
+                except:
+                    pass
+                
+                time.sleep(0.1 * retry_count)  # Exponential backoff
+                continue
+            else:
+                # Not a retry error, or max retries exceeded - fail immediately
+                if is_retry_error:
+                    print(f"❌ Max retries ({max_retries}) exceeded")
+                raise
     
     # Get final table state
     stats_after = get_table_stats(conn, table_name)
