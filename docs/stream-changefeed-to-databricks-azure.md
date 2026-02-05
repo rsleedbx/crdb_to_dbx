@@ -61,7 +61,7 @@ changefeed-events/parquet/defaultdb/public/usertable/usertable_cdc/
   └── ...
 ```
 
-**Schema file (YCSB example).** The autoloader reads primary keys from a schema file in the same container when required. Primary key is **not** used for append-only mode; it is **required** for all other modes (update/delete MERGE, multi–column-family merge). Every CockroachDB table has a primary key—if you do not define one, [CockroachDB adds a hidden one automatically](https://www.cockroachlabs.com/docs/stable/schema-design-table#primary-key-best-practices). Place the schema file at:
+**Step 2b. Schema file (optional for append-only).** For **append-only** mode you can skip this step. For update/delete MERGE and multi–column-family merge, the autoloader must read primary keys from a schema file in the same container. Every CockroachDB table has a primary key—if you do not define one, [CockroachDB adds a hidden one automatically](https://www.cockroachlabs.com/docs/stable/schema-design-table#primary-key-best-practices). When required, place the schema file at:
 
 `changefeed-events/parquet/defaultdb/public/usertable/_metadata/schema.json`
 
@@ -207,7 +207,7 @@ CockroachDB [column families](https://www.cockroachlabs.com/docs/stable/column-f
 
 ## Architecture
 
-![CDC Architecture Diagram](mermaid-diagram-2026-02-04-193854.png)
+![CDC Architecture Diagram](mermaid-diagram-2026-02-05-171357.png)
 
 *The data flow from CockroachDB through Azure Blob Storage and Unity Catalog to Delta Lake using Databricks Auto Loader. 
 
@@ -330,7 +330,7 @@ result = ingest_cdc_with_merge_multi_family(config=config, spark=spark)
 ```
 
 **What happens:**
-1. Scans Azure for `.RESOLVED` files (CockroachDB format: 33 digits = 14 datetime + 9 nanos + 10 logical; any other format raises).
+1. Scans Azure for `.RESOLVED` files (CockroachDB format: 33 digits = 14 datetime + 9 nanos + 10 logical).
 2. Converts the latest RESOLVED filename to full HLC string (`"WallTime.Logical"`) to match `__crdb__updated`.
 3. Filters CDC events: `__crdb__updated <= watermark` (full HLC string comparison).
 4. Guarantees all column family fragments are complete.
@@ -345,7 +345,7 @@ In test we validate that source (CockroachDB) and target (Databricks Delta) are 
 
 ## Security
 
-The ingestion pipeline is designed so that **the autoloader and streaming job do not need CockroachDB or Azure credentials**. Schema and Parquet files are read from storage (Azure Blob or Unity Catalog Volume over the same storage). Primary keys are resolved from the persisted schema file (`_metadata/schema.json`), so the backend that runs the autoloader does not need access to the source database. Only the notebook or job that *starts* the changefeed and sets up the External Location / External Volume needs database and Azure credentials; the ongoing ingestion job is credential-minimal and secure.
+The ingestion pipeline is designed so that **the autoloader and streaming job do not need CockroachDB or Azure credentials**. Schema and Parquet files are read from storage (Azure Blob or Unity Catalog Volume over the same storage). Primary keys are resolved from the persisted schema file (`_metadata/schema.json`), so the backend that runs the autoloader does not need access to the source database. Only the notebook or job that *starts* the changefeed and sets up the External Location / External Volume needs database and Azure credentials.
 
 ---
 
