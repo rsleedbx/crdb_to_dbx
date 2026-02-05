@@ -62,6 +62,9 @@ class CDCConfig:
     format: str
     path: str
     use_resolved_watermark: bool = True  # Use RESOLVED timestamps for column family completeness
+    # Optional: base path for streaming checkpoints. checkpoint_path = checkpoint_base_path / table_name [+ mode_suffix].
+    # If unset (default): /Volumes/{destination_catalog}/{destination_schema}/checkpoints (create a Volume named "checkpoints" in the target schema).
+    checkpoint_base_path: Optional[str] = None
 
 
 @dataclass
@@ -196,13 +199,22 @@ def process_config(config: Dict[str, Any]) -> Config:
             volume_id=config["uc_external_volume"]["volume_id"]
         )
     
+    # Checkpoint base path: from config, or default = /Volumes/{destination_catalog}/{destination_schema}/checkpoints
+    dest_catalog = config["databricks_target"]["catalog"]
+    dest_schema = config["databricks_target"]["schema"]
+    checkpoint_base_path = config["cdc_config"].get("checkpoint_base_path")
+    if not checkpoint_base_path or not str(checkpoint_base_path).strip():
+        checkpoint_base_path = f"/Volumes/{dest_catalog}/{dest_schema}/checkpoints"
+
     cdc_config_obj = CDCConfig(
         mode=cdc_mode,
         column_family_mode=column_family_mode,
         primary_key_columns=primary_key_columns,
         auto_suffix_mode_family=auto_suffix,
         format=cdc_format,
-        path=path
+        path=path,
+        use_resolved_watermark=config["cdc_config"].get("use_resolved_watermark", True),
+        checkpoint_base_path=checkpoint_base_path
     )
     
     workload_config = WorkloadConfig(

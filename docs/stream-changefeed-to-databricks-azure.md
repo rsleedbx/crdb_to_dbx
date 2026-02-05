@@ -10,7 +10,7 @@ This guide shows how to stream CockroachDB data to Databricks using CockroachDB 
 
 CockroachDB changefeeds natively generate snapshot and CDC records in Parquet format to Azure Blob Storage. Databricks Auto Loader reads the Parquet files into a streaming DataFrame, Spark transforms the CDC events, and Delta Lake writes them as streaming tables with ACID guarantees.
 
-**Multi-table transactional consistency** is achieved using CockroachDB's RESOLVED timestamp watermarks as authoritative high-water marks: each table's RESOLVED file (written by CockroachDB changefeeds) guarantees that all CDC events up to that timestamp are complete, including all column family fragments. By coordinating ingestion across multiple tables using a shared minimum watermark, you maintain referential integrity and ensure all tables are synchronized to the same transactional point in time, preventing partial transaction visibility and data inconsistencies.
+**Multi-table transactional consistency** is achieved by using CockroachDB’s HLC (Hybrid Logical Clock) timestamps from the start: RESOLVED timestamp watermarks serve as authoritative high-water marks—each table’s RESOLVED file (written by CockroachDB changefeeds) guarantees that all CDC events up to that timestamp are complete, including all column family fragments. By coordinating ingestion across multiple tables using a shared minimum watermark, you maintain referential integrity and ensure all tables are synchronized to the same transactional point in time, preventing partial transaction visibility and data inconsistencies.
 
 **What Databricks handles natively:**
 - ✅ **SCD Type 1** (target maintains latest INSERT/UPDATE/DELETE state via MERGE INTO)
@@ -107,29 +107,30 @@ Use Databricks Auto Loader to automatically ingest CDC files in append-only mode
 from pyspark.sql import functions as F
 
 # Read CDC events from Azure (Auto Loader automatically discovers new files)
+# When using the connector, checkpoint is on the target schema (same as table); directory name = table name.
 raw_df = (spark.readStream
     .format("cloudFiles")
     .option("cloudFiles.format", "parquet")
-    .option("cloudFiles.schemaLocation", "/checkpoints/usertable_cdc/schema")
+    .option("cloudFiles.schemaLocation", "/checkpoints/usertable_cdc/schema")  # Example; connector uses target schema path
     .option("pathGlobFilter", "*usertable*.parquet")  # Exclude .RESOLVED files
     .option("recursiveFileLookup", "true")
     .load("abfss://changefeed-events@{storage_account}.dfs.core.windows.net/parquet/defaultdb/public/usertable/usertable_cdc/")
 )
 
 # Transform CockroachDB CDC format to Delta Lake
-# Note: __crdb__updated is HLC format '1234567890123456789.0000000001' (wall_time.logical)
-# The connector (cockroachdb_autoload) produces _cdc_timestamp_nanos (bigint) + _cdc_timestamp (string, nanosecond display).
-# Manual pipeline example below uses second precision; for nanos use extract wall time and from_unixtime with .SSSSSSSSS.
+# The connector keeps __crdb__updated (full HLC string); adds _cdc_operation.
+# MERGE and ordering use full HLC (__crdb__updated); display as-is.
+# Manual pipeline (if not using connector): keep __crdb__updated, add _cdc_operation only.
 df = raw_df.select(
     "*",
-    F.from_unixtime(F.split(F.col("__crdb__updated"), "\\.")[0].cast("bigint") / 1000000000).cast("timestamp").alias("_cdc_timestamp"),
     F.when(F.col("__crdb__event_type") == "d", "DELETE").otherwise("UPSERT").alias("_cdc_operation")
-).drop("__crdb__updated", "__crdb__event_type")
+).drop("__crdb__event_type")
 
 # Write to Delta Lake (append-only: target stores full history)
+# Connector uses checkpoint on target schema with directory name = table name.
 query = (df.writeStream
     .format("delta")
-    .option("checkpointLocation", "/checkpoints/usertable_cdc/data")
+    .option("checkpointLocation", "/checkpoints/usertable_cdc/data")  # Example; connector uses target schema path
     .option("mergeSchema", "true")
     .trigger(availableNow=True)
     .toTable("main.default.usertable_cdc")
@@ -140,19 +141,12 @@ query.awaitTermination()
 
 ### Step 6. Query your data *(Databricks)*
 
-```sql
-SELECT ycsb_key, field0, _cdc_operation, _cdc_timestamp 
-FROM main.default.usertable_cdc 
-ORDER BY _cdc_timestamp;
-```
+We use **full HLC** for merge and ordering: the connector keeps `__crdb__updated` as the canonical timestamp; MERGE conditions and `ORDER BY` use this column (lexicographic order = HLC order). Display it as-is:
 
-```
-+--------+-----------+--------------+-------------------+
-|ycsb_key|field0     |_cdc_operation|_cdc_timestamp     |
-+--------+-----------+--------------+-------------------+
-|1       |value_1_0  |UPSERT        |2026-01-28 19:10:00|
-|2       |value_2_0  |UPSERT        |2026-01-28 19:10:00|
-+--------+-----------+--------------+-------------------+
+```sql
+SELECT ycsb_key, field0, _cdc_operation, __crdb__updated
+FROM main.default.usertable_cdc
+ORDER BY __crdb__updated;
 ```
 
 **That's it!** You just implemented **append-only ingestion** (SCD Type 2) where the target table stores all CDC events (INSERT, UPDATE, DELETE) as rows for full history tracking.
@@ -191,7 +185,7 @@ CockroachDB [column families](https://www.cockroachlabs.com/docs/stable/column-f
 
 ## Beyond the Basics: Implementing UPDATE/DELETE Support
 
-The example above stores all CDC events as rows in the target table (SCD Type 2). For applications that need the target to maintain current state only (SCD Type 1), use Delta Lake's MERGE INTO operation:
+The example above stores all CDC events as rows in the target table (SCD Type 2). For applications that need the target to maintain current state only (SCD Type 1), use Delta Lake's MERGE INTO operation. **We use full HLC for the merge:** the connector keeps `__crdb__updated` (format `"WallTime.Logical"`); MERGE uses `source.__crdb__updated > target.__crdb__updated` so ordering is correct (lexicographic order = HLC order). See [nanosecond_merge.md](nanosecond_merge.md) for design details.
 
 ```python
 from delta.tables import DeltaTable
@@ -205,17 +199,19 @@ raw_df.writeStream.toTable(f"{target_table}_staging")
 # Stage 2: Apply MERGE from staging to final table
 staging_df = spark.read.table(f"{target_table}_staging")
 
-# Deduplicate to latest per key (use _cdc_timestamp_nanos when available for nanosecond ordering)
-window_spec = Window.partitionBy("ycsb_key").orderBy(F.col("_cdc_timestamp").desc())
+# Deduplicate to latest per key using full HLC (__crdb__updated; lexicographic order = HLC order)
+window_spec = Window.partitionBy("ycsb_key").orderBy(F.col("__crdb__updated").desc())
 deduped_df = staging_df.withColumn("_row_num", F.row_number().over(window_spec)) \
     .filter(F.col("_row_num") == 1).drop("_row_num")
 
-# Apply MERGE
+# Apply MERGE (full HLC: update when source.__crdb__updated > target.__crdb__updated)
 delta_table = DeltaTable.forName(spark, target_table)
+merge_time_condition = "target.__crdb__updated IS NULL OR source.__crdb__updated > target.__crdb__updated"
+# Clause order: whenMatchedDelete first so DELETEs remove rows before any update.
 delta_table.merge(deduped_df, "target.ycsb_key = source.ycsb_key") \
-    .whenMatchedUpdate(set={"*"}) \
     .whenMatchedDelete(condition="source._cdc_operation = 'DELETE'") \
-    .whenNotMatchedInsert(values={"*"}) \
+    .whenMatchedUpdate(condition=f"source._cdc_operation = 'UPSERT' AND ({merge_time_condition})", set={"*"}) \
+    .whenNotMatchedInsert(condition="source._cdc_operation = 'UPSERT'", values={"*"}) \
     .execute()
 ```
 
@@ -305,10 +301,16 @@ result = ingest_cdc_with_merge_multi_family(
 ```
 
 **What happens:**
-1. Scans Azure for `.RESOLVED` files
-2. Extracts latest watermark timestamp
-3. Filters CDC events: `__crdb__updated <= watermark`
-4. Guarantees all column family fragments are complete
+1. Scans Azure for `.RESOLVED` files (CockroachDB format: 33 digits = 14 datetime + 9 nanos + 10 logical; any other format raises).
+2. Converts the latest RESOLVED filename to full HLC string (`"WallTime.Logical"`) to match `__crdb__updated`.
+3. Filters CDC events: `__crdb__updated <= watermark` (full HLC string comparison).
+4. Guarantees all column family fragments are complete.
+
+---
+
+## Testing and validation
+
+In test we validate that source (CockroachDB) and target (Databricks Delta) are exactly the same: we compute a full sum over numeric and character columns across all rows and compare source vs target, and we perform row-by-row value checks (e.g. after deduplicating the target to latest-per-key). The tutorial notebook includes this verification so you can confirm CDC correctness end-to-end.
 
 ---
 
@@ -335,8 +337,7 @@ For multi-table coordination, column family details, and advanced usage examples
 
 This guide was created with guidance from:
 - [Andrew Deally](https://andrewdeally.medium.com/) - CockroachDB team for changefeed architecture and best practices
-
----
+- [Jitesh Soni](https://www.databricks.com/blog/author/jitesh-soni) – Databricks SME for advice on Auto Loader and Unity Catalog best practices
 
 ## License & Contributing
 

@@ -735,6 +735,20 @@ Mode: INCREMENTAL (reusing existing table/changefeed)
 ✅ CDC merge complete!
 ```
 
+#### Why Spark MERGE instead of SDP Auto CDC?
+
+We use explicit Spark MERGE (two-stage: stream to staging, then batch MERGE to target) rather than SDP’s **AUTO CDC** APIs for these reasons:
+
+1. **Column family fragments** – CockroachDB with `split_column_families` writes multiple Parquet rows per logical event (one per column family). We must merge those fragments into one row per (key, timestamp, operation) before any CDC merge. Auto CDC assumes one row per change and does not perform fragment merging.
+
+2. **RESOLVED watermark** – We filter by CockroachDB RESOLVED files so that only events up to a guaranteed-complete watermark are processed (required for multi-table consistency and column-family completeness). That filtering and watermark handling is CockroachDB-specific and happens before we have a clean “change stream” that Auto CDC could consume.
+
+3. **HLC ordering and MERGE semantics** – We use full HLC `__crdb__updated` for ordering and for the MERGE condition (`source.__crdb__updated > target.__crdb__updated`), and we require **whenMatchedDelete** before **whenMatchedUpdate** so DELETEs remove rows instead of updating them. Explicit MERGE gives us full control over clause order and conditions.
+
+4. **Source shape** – Our pipeline reads raw Parquet from cloud storage (Auto Loader), applies CockroachDB-specific transforms and fragment merge, then writes to staging and runs MERGE. Auto CDC expects a change-data feed (e.g. a streaming table) with a single sequence column and one row per logical change; our “source” only has that shape after the connector’s preprocessing.
+
+Using Spark MERGE keeps the pipeline compatible with all Databricks editions (including non-SDP), preserves a retryable staging layer, and lets us document and tune MERGE behavior (e.g. in [docs/nanosecond_merge.md](docs/nanosecond_merge.md)). See also [docs/stream-changefeed-to-databricks-azure.md](docs/stream-changefeed-to-databricks-azure.md).
+
 ---
 
 #### ⏸️ Step 4: DLT + Autoloader Production (0% - Not Started)

@@ -15,7 +15,13 @@ Auto Loader maintains a **checkpoint** that tracks:
 - Schema evolution history
 - Offsets for incremental processing
 
-**Location**: `/checkpoints/{schema}_{table_name}/`
+**Location**: Checkpoint path = `{checkpoint_base_path}/{table_name}` (plus `_merge` or `_merge_cf` for merge modes). Directory name is the table name.
+
+**Default:** If **`checkpoint_base_path`** is not set in `cdc_config`, the connector uses `/Volumes/{destination_catalog}/{destination_schema}/checkpoints`. Create a Unity Catalog Volume named **`checkpoints`** in the target schema (same catalog/schema as the target table). Override by setting `"checkpoint_base_path"` in `cdc_config` (e.g. another Volume path or a cloud path).
+
+**Best practice (per Databricks):** Store checkpoints in **fault-tolerant, governed storage**:
+- Use a **Unity Catalog Volume** in the same catalog/schema as the target table (default path above, or set `checkpoint_base_path`). ([Structured Streaming checkpoints](https://docs.databricks.com/en/structured-streaming/checkpoints.html))
+- **Rules:** One checkpoint location per streaming query; never share. When using file sinks, change checkpoint and output paths together.
 
 ### The "Files Not Being Processed" Problem
 
@@ -49,18 +55,18 @@ ingest_cdc_append_only_single_family(config, spark)
 
 **Option 1: Using Databricks UI** (Recommended for notebooks):
 1. Navigate to Workspace
-2. Find checkpoint location: `/checkpoints/{schema}_{table_name}`
+2. Find checkpoint location: target schema’s `checkpoints/{table_name}` (or `/checkpoints/{schema}_{table_name}` if using fallback)
 3. Right-click → Delete
 
 **Option 2: Using Databricks CLI**:
 ```bash
-databricks fs rm -r /checkpoints/{schema}_{table_name}
+databricks fs rm -r <checkpoint_path>   # e.g. schema location + /checkpoints/{table_name}
 ```
 
 **Option 3: Using notebook magic command**:
 ```python
 # In Databricks notebook
-%fs rm -r /checkpoints/{schema}_{table_name}
+%fs rm -r {checkpoint_path}   # get from _build_paths(config, spark=spark) or schema/checkpoints/table_name
 ```
 
 **Complete reset pattern** (notebooks Cell 18 cleanup):
@@ -68,9 +74,10 @@ databricks fs rm -r /checkpoints/{schema}_{table_name}
 # 1. Drop target table
 spark.sql(f"DROP TABLE IF EXISTS {target_table_fqn}")
 
-# 2. Clear checkpoint (using notebook magic)
-checkpoint_path = f"/checkpoints/{config.tables.destination_schema}_{config.tables.destination_table_name}"
-%fs rm -r {checkpoint_path}
+# 2. Clear checkpoint (checkpoint on target schema; directory = table name)
+from cockroachdb_autoload import _build_paths
+_, checkpoint_path, _ = _build_paths(config, spark=spark)
+dbutils.fs.rm(checkpoint_path, True)   # or %fs rm -r {checkpoint_path}
 
 # 3. Optionally clear staging table (for update_delete mode)
 staging_table = f"{target_table_fqn}_staging_cf"
@@ -170,8 +177,9 @@ This fix has been applied to `cockroachdb_autoload.py` in the `_setup_autoloader
 
 ```python
 # Development/testing reset (in Databricks notebook)
-checkpoint_path = f"/checkpoints/{schema}_{table}"
-%fs rm -r {checkpoint_path}
+from cockroachdb_autoload import _build_paths
+_, checkpoint_path, _ = _build_paths(config, spark=spark)
+dbutils.fs.rm(checkpoint_path, True)   # or %fs rm -r {checkpoint_path}
 
 # Then re-run ingestion
 ingest_cdc_...(config, spark)
@@ -192,8 +200,10 @@ ingest_cdc_...(config, spark)
 **Cause**: Checkpoint still active  
 **Fix**: Clear checkpoint before reprocessing
 ```python
-# In Databricks notebook
-%fs rm -r /checkpoints/{schema}_{table}
+# In Databricks notebook (checkpoint on target schema; directory = table name)
+from cockroachdb_autoload import _build_paths
+_, checkpoint_path, _ = _build_paths(config, spark=spark)
+dbutils.fs.rm(checkpoint_path, True)
 ```
 
 ### Problem: "Files not discovered"
@@ -210,7 +220,9 @@ from crdb_to_dbx.cockroachdb_config import get_storage_path
 print(f"Volume path: {get_storage_path(config)}")
 
 # Clear checkpoint (in Databricks notebook)
-%fs rm -r /checkpoints/{schema}_{table}
+from cockroachdb_autoload import _build_paths
+_, checkpoint_path, _ = _build_paths(config, spark=spark)
+dbutils.fs.rm(checkpoint_path, True)
 ```
 
 ---
@@ -241,6 +253,6 @@ print(f"Volume path: {get_storage_path(config)}")
 - Function signatures simplified
 
 **For checkpoint management in development**:
-- Use `%fs rm -r /checkpoints/{path}` in notebooks
-- Or use Databricks UI/CLI to delete checkpoints
+- Get path via `_build_paths(config, spark=spark)` (checkpoint on target schema, directory = table name)
+- Clear with `dbutils.fs.rm(checkpoint_path, True)` or Databricks UI/CLI
 - Never clear checkpoints in production

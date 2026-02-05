@@ -77,7 +77,7 @@ The repository includes comprehensive tutorial notebooks:
 - ✅ RESOLVED watermark coordination
 - ✅ Multi-table transaction consistency
 - ✅ Both storage providers (Azure, UC Volume)
-- ✅ Nanosecond-precision timestamps: `_cdc_timestamp_nanos` (bigint) for ordering/merge, `_cdc_timestamp` (string) for display
+- ✅ CDC timestamp: `__crdb__updated` (HLC string); display as-is (full HLC, do not drop logical)
 
 ## Documentation
 
@@ -95,6 +95,7 @@ The repository includes comprehensive tutorial notebooks:
 
 ### Implementation Details
 - **[Learnings & Summaries](docs/learnings/README.md)** - Implementation learnings and bug fixes
+- **[Nanosecond merge design](docs/nanosecond_merge.md)** - CDC timestamp precision: pros, cons, and choices (`nanosecond_merge` branch)
 - **[Evolution Strategy](CONNECTOR_EVOLUTION_STRATEGY.md)** - Architectural decisions and roadmap
 
 ## Related Resources
