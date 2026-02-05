@@ -183,7 +183,7 @@ CockroachDB [column families](https://www.cockroachlabs.com/docs/stable/column-f
 
 ![CDC Architecture Diagram](mermaid-diagram-2026-02-04-193854.png)
 
-*The data flow from CockroachDB through Azure Blob Storage and Unity Catalog to Delta Lake using Databricks Auto Loader. [View Mermaid source](architecture-diagram.mmd)*
+*The data flow from CockroachDB through Azure Blob Storage and Unity Catalog to Delta Lake using Databricks Auto Loader. 
 
 ---
 
