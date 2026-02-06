@@ -101,3 +101,6 @@ Temporary Items
 .apdisk
 
 .databricks
+
+# Cursor
+.cursor/rules/databricks-blogging-public-content.mdc
