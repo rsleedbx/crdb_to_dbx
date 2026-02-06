@@ -6,21 +6,15 @@
 
 ## Overview
 
-This guide shows how to stream CockroachDB data to Databricks using CockroachDB changefeeds, Azure Blob Storage, and Delta Lake. The pipeline captures both initial snapshots and ongoing changes (inserts, updates, deletes) from CockroachDB and makes them available in Databricks for analytics and applications.
+This guide shows how to stream CockroachDB data to Databricks using changefeeds, Azure Blob Storage, Unity Catalog, and Delta Lake. You get one platform for governed ingestion (Unity Catalog), exactly-once streaming (Auto Loader), and ACID tables (Delta Lake)—no custom ETL or credential-heavy ingestion jobs. Credentials are for data source prep (changefeed to storage); the ingestion backend is governed by Unity Catalog and resolves schema and primary keys from storage, so the ingestion job does not need source database credentials. Use this when replicating operational data into the lakehouse for analytics, reporting, or audit.
 
-CockroachDB changefeeds natively generate snapshot and CDC records in Parquet format to Azure Blob Storage. Databricks Auto Loader reads the Parquet files into a streaming DataFrame, Spark transforms the CDC events, and Delta Lake writes them as streaming tables with ACID guarantees.
+![CDC Architecture Diagram](mermaid-diagram-2026-02-05-171357.png)
 
-**Multi-table transactional consistency** is achieved by using CockroachDB’s HLC (Hybrid Logical Clock) timestamps from the start: RESOLVED timestamp watermarks serve as authoritative high-water marks—each table’s RESOLVED file (written by CockroachDB changefeeds) guarantees that all CDC events up to that timestamp are complete, including all column family fragments. By coordinating ingestion across multiple tables using a shared minimum watermark, you maintain referential integrity and ensure all tables are synchronized to the same transactional point in time, preventing partial transaction visibility and data inconsistencies.
+CockroachDB changefeeds write snapshot and CDC as Parquet to Azure; Auto Loader reads them into a streaming DataFrame; and the Medallion pattern (bronze → silver) orders, deduplicates, and merges events. This guide goes beyond staging (a raw dump into one table) to bronze and silver for real-world scenarios: correct insert/update/delete semantics and multi-table consistency.
 
-**What Databricks handles natively:**
-- ✅ **SCD Type 1** (target maintains latest INSERT/UPDATE/DELETE state via MERGE INTO)
-- ✅ **SCD Type 2** (target stores all INSERT/UPDATE/DELETE events as rows for full history)
-- ✅ **Column families** (CockroachDB's `split_column_families` for write-heavy concurrent workloads)
-- ✅ **Multi-table transaction consistency** (atomic commits coordinated across tables with CockroachDB RESOLVED timestamp watermarks)
-- ✅ **Schema evolution** (automatic schema inference and merging)
-- ✅ **Multiple CockroachDB changefeed formats to blob storage** (Parquet, JSON, Avro, CSV)
+**Multi-table transactional consistency** is achieved by using CockroachDB’s HLC and RESOLVED timestamp watermarks as authoritative high-water marks. Each table’s RESOLVED file guarantees all CDC events (including column-family fragments) are complete up to that time. Coordinating ingestion with a shared minimum watermark keeps referential integrity and synchronizes all tables to the same transactional point, avoiding partial transactions and inconsistencies.
 
-This guide focuses on **Parquet format** for native Delta Lake integration. 
+Databricks handles SCD Type 1 (latest state via MERGE) and Type 2 (full history), column families, schema evolution, and multiple changefeed formats (Parquet, JSON, Avro, CSV). This guide focuses on **Parquet format** for native Delta Lake integration. 
 
 ---
 
@@ -205,14 +199,6 @@ CockroachDB [column families](https://www.cockroachlabs.com/docs/stable/column-f
 
 ---
 
-## Architecture
-
-![CDC Architecture Diagram](mermaid-diagram-2026-02-05-171357.png)
-
-*The data flow from CockroachDB through Azure Blob Storage and Unity Catalog to Delta Lake using Databricks Auto Loader. 
-
----
-
 ## Beyond the Basics: Implementing UPDATE/DELETE Support
 
 The example above stores all CDC events as rows in the target table (SCD Type 2). For applications that need the target to maintain current state only (SCD Type 1), use Delta Lake's MERGE INTO operation. **We use full HLC for the merge:** the connector keeps `__crdb__updated` (format `"WallTime.Logical"`); MERGE uses `source.__crdb__updated > target.__crdb__updated` so ordering is correct (lexicographic order = HLC order). See [nanosecond_merge.md](nanosecond_merge.md) for design details.
@@ -353,11 +339,10 @@ The ingestion pipeline is designed so that **the autoloader and streaming job do
 
 **Complete working notebook**: All CDC modes and examples are available in `crdb_to_dbx/cockroachdb-cdc-tutorial.ipynb`.
 
-For multi-table coordination, column family details, and advanced usage examples, see the interactive tutorial notebook which includes:
+The single tutorial notebook includes:
 - All CDC modes (append-only, update-delete)
 - Both column family configurations (single_cf, multi_cf)
 - RESOLVED watermarking examples
-- Multi-table coordination patterns
 
 **Learn more:**
 - [CockroachDB Changefeed Documentation](https://www.cockroachlabs.com/docs/stable/create-changefeed)
@@ -378,6 +363,6 @@ This guide was created with guidance from:
 
 **License**: Apache 2.0
 
-We welcome contributions to this CockroachDB CDC to Databricks connector. We use GitHub Issues to track community reported issues and GitHub Pull Requests for accepting changes.
+We welcome contributions. See [CONTRIBUTING.md](../CONTRIBUTING.md) for how to contribute and who to contact. We use GitHub Issues for bugs and feature requests and GitHub Pull Requests for code changes.
 
 See [LICENSE](../LICENSE) for the full Apache 2.0 license text.
